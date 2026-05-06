@@ -98,14 +98,15 @@ public final class TankPressureService {
     private static void distributePressure(Level level, BlockFace start, int tankBottomY) {
         Map<BlockPos, Pair<Integer, Map<Direction, Boolean>>> pipeGraph = new HashMap<>();
         Set<BlockPos> visited = new java.util.HashSet<>();
-        ArrayDeque<Pair<Integer, BlockPos>> frontier = new ArrayDeque<>();
+        ArrayDeque<PathNode> frontier = new ArrayDeque<>();
 
-        frontier.add(Pair.of(0, start.getPos()));
+        frontier.add(new PathNode(0, start.getPos(), start.getFace()));
 
         while (!frontier.isEmpty()) {
-            Pair<Integer, BlockPos> entry = frontier.removeFirst();
-            int distance = entry.getFirst();
-            BlockPos currentPos = entry.getSecond();
+            PathNode entry = frontier.removeFirst();
+            int distance = entry.distance();
+            BlockPos currentPos = entry.pos();
+            Direction backToTank = entry.backToTank();
 
             if (distance > DEFAULT_MAX_DISTANCE) {
                 continue;
@@ -137,12 +138,15 @@ public final class TankPressureService {
                     continue;
                 }
 
+                boolean pointsBackToTank = face == backToTank;
+                boolean pressureIsInbound = pointsBackToTank;
+
                 FluidTransportBehaviour connectedPipe = FluidPropagator.getPipe(level, connectedPos);
                 boolean hasFluidCapability = FluidPropagator.hasFluidCapability(level, connectedPos, face.getOpposite());
                 boolean openEnd = FluidPropagator.isOpenEnd(level, currentPos, face);
 
                 CreateUnderPressure.LOGGER.info(
-                    "Connection detail pipePos={} face={} connectedPos={} connectedPipe={} fluidCapability={} openEnd={} connectedY={} tankBottomY={}",
+                    "Connection detail pipePos={} face={} connectedPos={} connectedPipe={} fluidCapability={} openEnd={} connectedY={} tankBottomY={} pointsBackToTank={} pressureInbound={}",
                     currentPos,
                     face,
                     connectedPos,
@@ -150,16 +154,18 @@ public final class TankPressureService {
                     hasFluidCapability,
                     openEnd,
                     connectedPos.getY(),
-                    tankBottomY
+                    tankBottomY,
+                    pointsBackToTank,
+                    pressureIsInbound
                 );
+
+                if (connectedPos.getY() > tankBottomY && !pointsBackToTank) {
+                    continue;
+                }
 
                 pipeGraph.computeIfAbsent(currentPos, $ -> Pair.of(distance, new IdentityHashMap<>()))
                     .getSecond()
-                    .put(face, true);
-
-                if (connectedPos.getY() > tankBottomY) {
-                    continue;
-                }
+                    .put(face, pressureIsInbound);
 
                 if (connectedPipe == null) {
                     continue;
@@ -169,7 +175,7 @@ public final class TankPressureService {
                     continue;
                 }
 
-                frontier.add(Pair.of(distance + 1, connectedPos));
+                frontier.add(new PathNode(distance + 1, connectedPos, face.getOpposite()));
             }
         }
 
@@ -203,17 +209,21 @@ public final class TankPressureService {
                 pipePos,
                 head,
                 pressure,
-                entry.getValue().getSecond().keySet(),
+                entry.getValue().getSecond(),
                 pipe.hasAnyPressure()
             );
 
-            for (Direction side : entry.getValue().getSecond().keySet()) {
-                pipe.addPressure(side, false, pressure);
+            for (Map.Entry<Direction, Boolean> sideEntry : entry.getValue().getSecond().entrySet()) {
+                Direction side = sideEntry.getKey();
+                boolean pressureIsInbound = sideEntry.getValue();
+
+                pipe.addPressure(side, pressureIsInbound, pressure);
 
                 CreateUnderPressure.LOGGER.info(
-                    "Added tank pressure FALSE pipePos={} side={} pressure={} hasPressureImmediately={} flowBeforeCache={}",
+                    "Added tank pressure DIRECTIONAL pipePos={} side={} inbound={} pressure={} hasPressureImmediately={} flowBeforeCache={}",
                     pipePos,
                     side,
+                    pressureIsInbound,
                     pressure,
                     pipe.hasAnyPressure(),
                     describeFlow(pipe.getFlow(side))
@@ -263,4 +273,6 @@ public final class TankPressureService {
 
         return description.append("}").toString();
     }
+
+    private record PathNode(int distance, BlockPos pos, Direction backToTank) {}
 }
