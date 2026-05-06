@@ -25,6 +25,7 @@ public final class TankQoLService {
     private static final int TICK_INTERVAL = 5;
     private static final int MAX_DISTANCE = 96;
     private static final int EDGE_CLEANUP_MB = 5;
+    private static final int COMMON_SNAP_MAX_SPREAD_MB = 32;
 
     public static void tickTank(FluidTankBlockEntity tickTank) {
         Level level = tickTank.getLevel();
@@ -40,9 +41,10 @@ public final class TankQoLService {
 
         Random random = new Random(level.getGameTime() ^ tickTank.getController().asLong());
         int cleaned = cleanupEdges(network.tanks, random);
+        int balanced = balanceCommonValue(network.tanks, random);
 
-        if (cleaned > 0) {
-            DebugInfo.log(level, "TANK qol source={} tanks={} cleanup={}", tickTank.getController(), network.tanks.size(), cleaned);
+        if (cleaned > 0 || balanced > 0) {
+            DebugInfo.log(level, "TANK qol source={} tanks={} cleanup={} balanced={}", tickTank.getController(), network.tanks.size(), cleaned, balanced);
         }
     }
 
@@ -68,6 +70,68 @@ public final class TankQoLService {
         }
 
         return moved;
+    }
+
+    private static int balanceCommonValue(List<FluidTankBlockEntity> tanks, Random random) {
+        if (tanks.size() < 2) return 0;
+
+        int capacity = tanks.get(0).getTankInventory().getCapacity();
+        int total = 0;
+        int min = Integer.MAX_VALUE;
+        int max = Integer.MIN_VALUE;
+
+        for (FluidTankBlockEntity tank : tanks) {
+            if (tank.getTankInventory().getCapacity() != capacity) return 0;
+            int amount = tank.getTankInventory().getFluidAmount();
+            total += amount;
+            min = Math.min(min, amount);
+            max = Math.max(max, amount);
+        }
+
+        if (max <= min) return 0;
+        if (max - min > COMMON_SNAP_MAX_SPREAD_MB) return 0;
+        if (total % tanks.size() != 0) return 0;
+
+        int target = total / tanks.size();
+        if (target <= 0 || target >= capacity) return 0;
+
+        List<FluidTankBlockEntity> sources = new ArrayList<>();
+        List<FluidTankBlockEntity> targets = new ArrayList<>();
+        for (FluidTankBlockEntity tank : tanks) {
+            int amount = tank.getTankInventory().getFluidAmount();
+            if (amount > target) sources.add(tank);
+            if (amount < target) targets.add(tank);
+        }
+
+        if (sources.isEmpty() || targets.isEmpty()) return 0;
+
+        Collections.shuffle(sources, random);
+        Collections.shuffle(targets, random);
+
+        int movedTotal = 0;
+        int sourceIndex = 0;
+        for (FluidTankBlockEntity targetTank : targets) {
+            int needed = target - targetTank.getTankInventory().getFluidAmount();
+            while (needed > 0 && sourceIndex < sources.size()) {
+                FluidTankBlockEntity sourceTank = sources.get(sourceIndex);
+                int surplus = sourceTank.getTankInventory().getFluidAmount() - target;
+                if (surplus <= 0) {
+                    sourceIndex++;
+                    continue;
+                }
+
+                int moved = moveFluid(sourceTank, targetTank, Math.min(needed, surplus));
+                if (moved <= 0) {
+                    sourceIndex++;
+                    continue;
+                }
+
+                needed -= moved;
+                movedTotal += moved;
+            }
+        }
+
+        return movedTotal;
     }
 
     private static int moveIntoRandomOtherTank(FluidTankBlockEntity from, List<FluidTankBlockEntity> shuffled, int amount) {
