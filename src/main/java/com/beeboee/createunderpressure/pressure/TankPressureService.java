@@ -48,36 +48,36 @@ public final class TankPressureService {
         if (level.getGameTime() % TICK_INTERVAL != 0) return;
 
         equalizeConnectedTanks(level, tank);
+    }
 
-        Set<BlockPos> alreadyScanned = new HashSet<>();
-        for (BlockPos seed : seeds(level, tank)) {
-            if (alreadyScanned.contains(seed)) continue;
+    public static void tickPipe(FluidTransportBehaviour pipe) {
+        Level level = pipe.getWorld();
+        if (level == null || level.isClientSide) return;
+        if (level.getGameTime() % TICK_INTERVAL != 0) return;
 
-            Scan scan = scan(level, seed);
-            if (scan == null || scan.pipes.isEmpty()) continue;
-            alreadyScanned.addAll(scan.pipes);
+        BlockPos seed = pipe.getPos();
+        Scan scan = scan(level, seed);
+        if (scan == null || scan.pipes.isEmpty()) return;
+        if (!ownsPipeNetwork(scan, seed)) return;
 
-            End source = bestSource(scan);
-            if (source == null) continue;
+        End source = bestSource(scan);
+        if (source == null) return;
 
-            List<End> targets = targets(scan, source);
-            if (targets.isEmpty()) {
-                if (ownsNetwork(source, targets, tank)) DebugInfo.log(level, "NETWORK idle source={} surface={} endpoints={}", source.name(), source.surface, scan.ends.size());
-                continue;
-            }
-
-            if (!ownsNetwork(source, targets, tank)) continue;
-
-            List<Route> routes = routes(level, scan, source, targets);
-            if (routes.isEmpty()) {
-                DebugInfo.log(level, "NETWORK blocked source={} targets={}", source.name(), targets.size());
-                continue;
-            }
-
-            float share = 1.0f / routes.size();
-            DebugInfo.log(level, "NETWORK split source={} targets={} share={}", source.name(), routes.size(), share);
-            for (Route route : routes) apply(level, source, route.target, route.path, share);
+        List<End> targets = targets(scan, source);
+        if (targets.isEmpty()) {
+            DebugInfo.log(level, "GRAPH idle owner={} source={} surface={} endpoints={} pipes={}", seed, source.name(), source.surface, scan.ends.size(), scan.pipes.size());
+            return;
         }
+
+        List<Route> routes = routes(level, scan, source, targets);
+        if (routes.isEmpty()) {
+            DebugInfo.log(level, "GRAPH blocked owner={} source={} targets={}", seed, source.name(), targets.size());
+            return;
+        }
+
+        float share = 1.0f / routes.size();
+        DebugInfo.log(level, "GRAPH split owner={} source={} targets={} share={} pipes={}", seed, source.name(), routes.size(), share, scan.pipes.size());
+        for (Route route : routes) apply(level, source, route.target, route.path, share);
     }
 
     private static void equalizeConnectedTanks(Level level, FluidTankBlockEntity tickTank) {
@@ -308,6 +308,7 @@ public final class TankPressureService {
 
     private static Scan scan(Level level, BlockPos seed) {
         Set<BlockPos> pipes = new HashSet<>();
+        Set<BlockPos> bridgedTanks = new HashSet<>();
         List<End> ends = new ArrayList<>();
         ArrayDeque<Node> queue = new ArrayDeque<>();
         queue.add(new Node(seed, 0));
@@ -328,6 +329,9 @@ public final class TankPressureService {
                 FluidTankBlockEntity tank = tankAt(level, other);
                 if (tank != null) {
                     ends.add(End.tank(node.pos, face, tank));
+                    if (bridgedTanks.add(tank.getController())) {
+                        for (BlockPos tankSeed : seeds(level, tank)) queue.add(new Node(tankSeed, node.distance + 1));
+                    }
                     continue;
                 }
 
@@ -406,15 +410,12 @@ public final class TankPressureService {
         return routes;
     }
 
-    private static boolean ownsNetwork(End source, List<End> targets, FluidTankBlockEntity tank) {
-        if (source.tank != null) return belongsToTank(source, tank);
-
-        End owner = null;
-        for (End target : targets) {
-            if (target.tank == null) continue;
-            if (owner == null || compareBlockPos(target.tank.getController(), owner.tank.getController()) < 0) owner = target;
+    private static boolean ownsPipeNetwork(Scan scan, BlockPos seed) {
+        BlockPos owner = null;
+        for (BlockPos pipe : scan.pipes) {
+            if (owner == null || compareBlockPos(pipe, owner) < 0) owner = pipe;
         }
-        return owner != null && belongsToTank(owner, tank);
+        return seed.equals(owner);
     }
 
     private static int compareBlockPos(BlockPos a, BlockPos b) {
@@ -425,10 +426,6 @@ public final class TankPressureService {
 
     private static boolean sameTank(End a, End b) {
         return a.tank != null && b.tank != null && a.tank.getController().equals(b.tank.getController());
-    }
-
-    private static boolean belongsToTank(End end, FluidTankBlockEntity tank) {
-        return end.tank != null && end.tank.getController().equals(tank.getController());
     }
 
     private static List<Step> path(Level level, Scan scan, BlockPos source, BlockPos target) {
@@ -443,11 +440,27 @@ public final class TankPressureService {
             if (pos.equals(target)) break;
             FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, pos);
             if (pipe == null) continue;
+
             for (Direction face : FluidPropagator.getPipeConnections(level.getBlockState(pos), pipe)) {
                 BlockPos other = pos.relative(face);
-                if (!scan.pipes.contains(other) || !visited.add(other)) continue;
-                from.put(other, new Step(pos, face, other));
-                queue.add(other);
+                if (!level.isLoaded(other)) continue;
+
+                if (scan.pipes.contains(other) && visited.add(other)) {
+                    from.put(other, new Step(pos, face, other, face.getOpposite()));
+                    queue.add(other);
+                    continue;
+                }
+
+                FluidTankBlockEntity tank = tankAt(level, other);
+                if (tank == null) continue;
+
+                for (BlockPos tankSeed : seeds(level, tank)) {
+                    if (tankSeed.equals(pos) || !scan.pipes.contains(tankSeed) || !visited.add(tankSeed)) continue;
+                    Direction targetFace = faceToTank(level, tank, tankSeed);
+                    if (targetFace == null) continue;
+                    from.put(tankSeed, new Step(pos, face, tankSeed, targetFace));
+                    queue.add(tankSeed);
+                }
             }
         }
 
@@ -465,6 +478,15 @@ public final class TankPressureService {
         return out;
     }
 
+    private static Direction faceToTank(Level level, FluidTankBlockEntity tank, BlockPos pipePos) {
+        BlockPos controller = tank.getController();
+        for (Direction direction : Direction.values()) {
+            FluidTankBlockEntity adjacent = tankAt(level, pipePos.relative(direction));
+            if (adjacent != null && adjacent.getController().equals(controller)) return direction;
+        }
+        return null;
+    }
+
     private static void apply(Level level, End source, End target, List<Step> path, float share) {
         double head = source.surface - target.surface;
         float pressure = pressureForHead(head) * share * fluidPressureMultiplier(source);
@@ -473,19 +495,19 @@ public final class TankPressureService {
 
         graph.computeIfAbsent(source.pipe, $ -> new IdentityHashMap<>()).put(source.face, true);
         for (Step step : path) {
-            graph.computeIfAbsent(step.from, $ -> new IdentityHashMap<>()).put(step.face, false);
-            graph.computeIfAbsent(step.to, $ -> new IdentityHashMap<>()).put(step.face.getOpposite(), true);
+            graph.computeIfAbsent(step.from, $ -> new IdentityHashMap<>()).put(step.fromFace, false);
+            graph.computeIfAbsent(step.to, $ -> new IdentityHashMap<>()).put(step.toFace, true);
         }
         graph.computeIfAbsent(target.pipe, $ -> new IdentityHashMap<>()).put(target.face, false);
 
-        DebugInfo.log(level, "NETWORK apply source={} target={} head={} pressure={} share={} path={}", source.name(), target.name(), head, pressure, share, path.size());
+        DebugInfo.log(level, "GRAPH apply source={} target={} head={} pressure={} share={} path={}", source.name(), target.name(), head, pressure, share, path.size());
 
         for (Map.Entry<BlockPos, Map<Direction, Boolean>> pipeEntry : graph.entrySet()) {
             FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, pipeEntry.getKey());
             if (pipe == null) continue;
             for (Map.Entry<Direction, Boolean> side : pipeEntry.getValue().entrySet()) {
                 pipe.addPressure(side.getKey(), side.getValue(), pressure);
-                DebugInfo.log(level, "Added tank pressure NETWORK pipePos={} side={} inbound={} pressure={}", pipeEntry.getKey(), side.getKey(), side.getValue(), pressure);
+                DebugInfo.log(level, "Added graph pressure pipePos={} side={} inbound={} pressure={}", pipeEntry.getKey(), side.getKey(), side.getValue(), pressure);
             }
         }
 
@@ -532,7 +554,7 @@ public final class TankPressureService {
 
     private record Scan(Set<BlockPos> pipes, List<End> ends) {}
     private record Node(BlockPos pos, int distance) {}
-    private record Step(BlockPos from, Direction face, BlockPos to) {}
+    private record Step(BlockPos from, Direction fromFace, BlockPos to, Direction toFace) {}
     private record Route(End target, List<Step> path) {}
     private record TankNetwork(List<FluidTankBlockEntity> tanks, FluidTankBlockEntity owner) {}
     private static final class TankDelta {
