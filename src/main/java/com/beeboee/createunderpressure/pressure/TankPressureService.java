@@ -46,11 +46,11 @@ public final class TankPressureService {
 
             List<End> targets = targets(scan, source);
             if (targets.isEmpty()) {
-                DebugInfo.log(level, "NETWORK idle source={} surface={} endpoints={}", source.name(), source.surface, scan.ends.size());
+                if (ownsNetwork(source, targets, tank)) DebugInfo.log(level, "NETWORK idle source={} surface={} endpoints={}", source.name(), source.surface, scan.ends.size());
                 continue;
             }
 
-            if (!belongsToTank(source, tank) && targets.stream().noneMatch(target -> belongsToTank(target, tank))) continue;
+            if (!ownsNetwork(source, targets, tank)) continue;
 
             List<Route> routes = routes(level, scan, source, targets);
             if (routes.isEmpty()) {
@@ -150,6 +150,23 @@ public final class TankPressureService {
             if (path != null) routes.add(new Route(target, path));
         }
         return routes;
+    }
+
+    private static boolean ownsNetwork(End source, List<End> targets, FluidTankBlockEntity tank) {
+        if (source.tank != null) return belongsToTank(source, tank);
+
+        End owner = null;
+        for (End target : targets) {
+            if (target.tank == null) continue;
+            if (owner == null || compareBlockPos(target.tank.getController(), owner.tank.getController()) < 0) owner = target;
+        }
+        return owner != null && belongsToTank(owner, tank);
+    }
+
+    private static int compareBlockPos(BlockPos a, BlockPos b) {
+        if (a.getX() != b.getX()) return Integer.compare(a.getX(), b.getX());
+        if (a.getY() != b.getY()) return Integer.compare(a.getY(), b.getY());
+        return Integer.compare(a.getZ(), b.getZ());
     }
 
     private static boolean sameTank(End a, End b) {
