@@ -31,6 +31,8 @@ public final class TankPressureService {
     private static final int TANK_TRANSFER_EPSILON_MB = 5;
     private static final double TANK_TRANSFER_FACTOR = 0.20;
     private static final double LAVA_TANK_TRANSFER_FACTOR = 0.08;
+    private static final double TANK_RATE_FULL_HEAD = 4.0;
+    private static final double TANK_MIN_RATE_MULTIPLIER = 0.05;
     private static final float LAVA_PRESSURE_MULTIPLIER = 0.35f;
     private static final float TRICKLE_PRESSURE = 8.0f;
     private static final float MIN_PRESSURE = 16.0f;
@@ -102,38 +104,89 @@ public final class TankPressureService {
             int current = tank.getTankInventory().getFluidAmount();
             int target = amountForSurface(tank, targetSurface);
             int delta = target - current;
-            if (delta > TANK_TRANSFER_EPSILON_MB) deficit.add(new TankDelta(tank, delta));
-            if (delta < -TANK_TRANSFER_EPSILON_MB) surplus.add(new TankDelta(tank, -delta));
+            if (delta > TANK_TRANSFER_EPSILON_MB) deficit.add(new TankDelta(tank, surface(tank), delta));
+            if (delta < -TANK_TRANSFER_EPSILON_MB) surplus.add(new TankDelta(tank, surface(tank), -delta));
         }
 
         if (surplus.isEmpty() || deficit.isEmpty()) return;
 
-        int budget = transferCap;
-        int movedTotal = 0;
+        surplus.sort(Comparator.comparingDouble((TankDelta delta) -> delta.surface).reversed().thenComparing(delta -> delta.tank.getController(), TankPressureService::compareBlockPos));
+        deficit.sort(Comparator.comparingDouble((TankDelta delta) -> delta.surface).thenComparing(delta -> delta.tank.getController(), TankPressureService::compareBlockPos));
+
+        int totalOutPlan = 0;
         for (TankDelta from : surplus) {
-            if (budget <= 0) break;
-            int available = Math.max(1, (int) Math.ceil(from.amount * transferFactor));
-            available = Math.min(available, from.amount);
-
-            for (TankDelta to : deficit) {
-                if (budget <= 0 || available <= 0) break;
-                if (to.amount <= 0) continue;
-
-                int wanted = Math.max(1, (int) Math.ceil(to.amount * transferFactor));
-                wanted = Math.min(wanted, to.amount);
-                int requested = Math.min(Math.min(available, wanted), budget);
-
-                int moved = moveFluid(from.tank, to.tank, requested);
-                if (moved <= 0) continue;
-
-                available -= moved;
-                to.amount -= moved;
-                budget -= moved;
-                movedTotal += moved;
-            }
+            from.plan = plannedTankMove(from, targetSurface, transferFactor, transferCap);
+            totalOutPlan += from.plan;
         }
 
-        if (movedTotal > 0) DebugInfo.log(level, "TANK smooth source={} fluid={} tanks={} targetSurface={} moved={} cap={} factor={}", tickTank.getController(), groupFluid.getHoverName().getString(), network.tanks.size(), targetSurface, movedTotal, transferCap, transferFactor);
+        int totalInPlan = 0;
+        for (TankDelta to : deficit) {
+            to.plan = plannedTankMove(to, targetSurface, transferFactor, transferCap);
+            totalInPlan += to.plan;
+        }
+
+        int transferBudget = Math.min(totalOutPlan, totalInPlan);
+        if (transferBudget <= 0) return;
+
+        scalePlans(deficit, totalInPlan, transferBudget);
+        scalePlans(surplus, totalOutPlan, transferBudget);
+
+        int movedTotal = 0;
+        int sourceIndex = 0;
+        int targetsMoved = 0;
+        for (TankDelta to : deficit) {
+            int remainingNeed = to.plan;
+            int movedToTarget = 0;
+
+            while (remainingNeed > 0 && sourceIndex < surplus.size()) {
+                TankDelta from = surplus.get(sourceIndex);
+                if (from.plan <= 0) {
+                    sourceIndex++;
+                    continue;
+                }
+
+                int requested = Math.min(remainingNeed, from.plan);
+                int moved = moveFluid(from.tank, to.tank, requested);
+                if (moved <= 0) {
+                    from.plan = 0;
+                    sourceIndex++;
+                    continue;
+                }
+
+                from.plan -= moved;
+                remainingNeed -= moved;
+                movedToTarget += moved;
+                movedTotal += moved;
+            }
+
+            if (movedToTarget > 0) targetsMoved++;
+        }
+
+        if (movedTotal > 0) DebugInfo.log(level, "TANK smooth source={} fluid={} tanks={} targetSurface={} moved={} targetsMoved={} sources={} cap={} factor={}", tickTank.getController(), groupFluid.getHoverName().getString(), network.tanks.size(), targetSurface, movedTotal, targetsMoved, surplus.size(), transferCap, transferFactor);
+    }
+
+    private static int plannedTankMove(TankDelta delta, double targetSurface, double transferFactor, int transferCap) {
+        double head = Math.abs(delta.surface - targetSurface);
+        double headMultiplier = Math.max(TANK_MIN_RATE_MULTIPLIER, Math.min(1.0, head / TANK_RATE_FULL_HEAD));
+        int planned = (int) Math.ceil(delta.amount * transferFactor * headMultiplier);
+        return Math.max(1, Math.min(Math.min(delta.amount, transferCap), planned));
+    }
+
+    private static void scalePlans(List<TankDelta> deltas, int totalPlan, int budget) {
+        if (totalPlan <= budget) return;
+
+        int remainingBudget = budget;
+        int remainingPlan = totalPlan;
+        for (int i = 0; i < deltas.size(); i++) {
+            TankDelta delta = deltas.get(i);
+            int original = delta.plan;
+
+            if (i == deltas.size() - 1) delta.plan = Math.min(original, remainingBudget);
+            else delta.plan = Math.min(original, Math.max(1, (int) Math.round((double) remainingBudget * original / remainingPlan)));
+
+            remainingBudget -= delta.plan;
+            remainingPlan -= original;
+        }
     }
 
     private static int moveFluid(FluidTankBlockEntity from, FluidTankBlockEntity to, int amount) {
@@ -484,10 +537,13 @@ public final class TankPressureService {
     private record TankNetwork(List<FluidTankBlockEntity> tanks, FluidTankBlockEntity owner) {}
     private static final class TankDelta {
         final FluidTankBlockEntity tank;
-        int amount;
+        final double surface;
+        final int amount;
+        int plan;
 
-        TankDelta(FluidTankBlockEntity tank, int amount) {
+        TankDelta(FluidTankBlockEntity tank, double surface, int amount) {
             this.tank = tank;
+            this.surface = surface;
             this.amount = amount;
         }
     }
