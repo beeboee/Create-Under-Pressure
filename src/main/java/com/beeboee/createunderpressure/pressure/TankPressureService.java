@@ -30,6 +30,7 @@ public final class TankPressureService {
     private static final float MIN_PRESSURE = 16.0f;
     private static final float MAX_PRESSURE = 256.0f;
     private static final double DEAD_HEAD = 0.125;
+    private static final double TANK_SETTLE_HEAD = 0.5;
     private static final double TRICKLE_HEAD = 1.0;
     private static final double MAX_HEAD = 32.0;
     private static final double EPSILON = 0.01;
@@ -152,7 +153,8 @@ public final class TankPressureService {
             if (!end.receives) continue;
             if (sameTank(source, end)) continue;
             if (!compatible(source, end)) continue;
-            if (end.surface >= source.surface - DEAD_HEAD) continue;
+            double requiredHead = tankToTank(source, end) ? TANK_SETTLE_HEAD : DEAD_HEAD;
+            if (end.surface >= source.surface - requiredHead) continue;
             targets.add(end);
         }
         targets.sort(Comparator.comparingDouble((End end) -> source.surface - end.surface).reversed().thenComparingInt(end -> end.pipe.getY()));
@@ -167,6 +169,10 @@ public final class TankPressureService {
         return sourceFluid.isEmpty() || targetFluid.isEmpty() || FluidStack.isSameFluidSameComponents(sourceFluid, targetFluid);
     }
 
+    private static boolean tankToTank(End source, End target) {
+        return source.tank != null && target.tank != null;
+    }
+
     private static List<Route> routes(Level level, Scan scan, End source, List<End> targets) {
         List<Route> routes = new ArrayList<>();
         Set<BlockPos> usedTargets = new HashSet<>();
@@ -176,6 +182,7 @@ public final class TankPressureService {
             if (path == null) continue;
             if (blockedByEarlierReceivingTank(scan, source, target, path)) continue;
             routes.add(new Route(target, path));
+            if (tankToTank(source, target)) break;
         }
         return routes;
     }
