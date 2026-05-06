@@ -26,6 +26,7 @@ public final class TankPressureService {
     private static final int TICK_INTERVAL = 5;
     private static final int MAX_DISTANCE = 96;
     private static final float LAVA_PRESSURE_MULTIPLIER = 0.35f;
+    private static final float TANK_PRESSURE_MULTIPLIER = 0.12f;
     private static final float TRICKLE_PRESSURE = 8.0f;
     private static final float MIN_PRESSURE = 16.0f;
     private static final float MAX_PRESSURE = 256.0f;
@@ -299,7 +300,7 @@ public final class TankPressureService {
 
     private static void apply(Level level, End source, End target, List<Step> path, float share) {
         double head = source.surface - target.surface;
-        float pressure = pressureForHead(head) * share * fluidPressureMultiplier(source);
+        float pressure = pressureForHead(head) * share * pressureMultiplier(source, target);
         if (pressure <= 0) return;
         Map<BlockPos, Map<Direction, Boolean>> graph = new HashMap<>();
 
@@ -322,6 +323,12 @@ public final class TankPressureService {
         }
 
         for (BlockPos pipePos : graph.keySet()) FluidTransportBehaviour.cacheFlows(level, pipePos);
+    }
+
+    private static float pressureMultiplier(End source, End target) {
+        float multiplier = fluidPressureMultiplier(source);
+        if (tankToTank(source, target)) multiplier *= TANK_PRESSURE_MULTIPLIER;
+        return multiplier;
     }
 
     private static float fluidPressureMultiplier(End source) {
