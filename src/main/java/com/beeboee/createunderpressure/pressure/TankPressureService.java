@@ -192,10 +192,10 @@ public final class TankPressureService {
             );
 
             for (Direction side : entry.getValue().getSecond().keySet()) {
-                pipe.addPressure(side, true, pressure);
+                pipe.addPressure(side, false, pressure);
 
                 CreateUnderPressure.LOGGER.info(
-                    "Added tank pressure TRUE pipePos={} side={} pressure={} hasPressureImmediately={} flowAfter={}",
+                    "Added tank pressure FALSE pipePos={} side={} pressure={} hasPressureImmediately={} flowAfter={}",
                     pipePos,
                     side,
                     pressure,
