@@ -1,6 +1,7 @@
 package com.beeboee.createunderpressure.pressure;
 
 import com.beeboee.createunderpressure.CreateUnderPressure;
+import java.lang.reflect.Field;
 import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
@@ -28,7 +29,7 @@ import net.minecraft.world.level.block.state.BlockState;
 public final class TankPressureService {
     private TankPressureService() {}
 
-    private static final int TICK_INTERVAL = 10;
+    private static final int TICK_INTERVAL = 20;
     private static final int DEFAULT_MAX_DISTANCE = 64;
     private static final float PRESSURE_PER_BLOCK = 8.0f;
     private static final float MAX_PRESSURE = 256.0f;
@@ -136,6 +137,22 @@ public final class TankPressureService {
                     continue;
                 }
 
+                FluidTransportBehaviour connectedPipe = FluidPropagator.getPipe(level, connectedPos);
+                boolean hasFluidCapability = FluidPropagator.hasFluidCapability(level, connectedPos, face.getOpposite());
+                boolean openEnd = FluidPropagator.isOpenEnd(level, currentPos, face);
+
+                CreateUnderPressure.LOGGER.info(
+                    "Connection detail pipePos={} face={} connectedPos={} connectedPipe={} fluidCapability={} openEnd={} connectedY={} tankBottomY={}",
+                    currentPos,
+                    face,
+                    connectedPos,
+                    connectedPipe != null,
+                    hasFluidCapability,
+                    openEnd,
+                    connectedPos.getY(),
+                    tankBottomY
+                );
+
                 pipeGraph.computeIfAbsent(currentPos, $ -> Pair.of(distance, new IdentityHashMap<>()))
                     .getSecond()
                     .put(face, true);
@@ -144,7 +161,6 @@ public final class TankPressureService {
                     continue;
                 }
 
-                FluidTransportBehaviour connectedPipe = FluidPropagator.getPipe(level, connectedPos);
                 if (connectedPipe == null) {
                     continue;
                 }
@@ -195,12 +211,12 @@ public final class TankPressureService {
                 pipe.addPressure(side, false, pressure);
 
                 CreateUnderPressure.LOGGER.info(
-                    "Added tank pressure FALSE pipePos={} side={} pressure={} hasPressureImmediately={} flowAfter={}",
+                    "Added tank pressure FALSE pipePos={} side={} pressure={} hasPressureImmediately={} flowBeforeCache={}",
                     pipePos,
                     side,
                     pressure,
                     pipe.hasAnyPressure(),
-                    pipe.getFlow(side)
+                    describeFlow(pipe.getFlow(side))
                 );
             }
 
@@ -211,6 +227,40 @@ public final class TankPressureService {
                 pipePos,
                 pipe.hasAnyPressure()
             );
+
+            for (Direction side : Direction.values()) {
+                CreateUnderPressure.LOGGER.info(
+                    "Flow detail pipePos={} side={} flow={}",
+                    pipePos,
+                    side,
+                    describeFlow(pipe.getFlow(side))
+                );
+            }
         }
+    }
+
+    private static String describeFlow(Object flow) {
+        if (flow == null) {
+            return "null";
+        }
+
+        StringBuilder description = new StringBuilder(flow.getClass().getSimpleName()).append("{");
+        Field[] fields = flow.getClass().getDeclaredFields();
+
+        for (int i = 0; i < fields.length; i++) {
+            Field field = fields[i];
+            try {
+                field.setAccessible(true);
+                description.append(field.getName()).append("=").append(field.get(flow));
+            } catch (Throwable throwable) {
+                description.append(field.getName()).append("=<unreadable:").append(throwable.getClass().getSimpleName()).append(">");
+            }
+
+            if (i < fields.length - 1) {
+                description.append(", ");
+            }
+        }
+
+        return description.append("}").toString();
     }
 }
