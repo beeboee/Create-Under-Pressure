@@ -27,23 +27,4 @@ public final class DebugStickEvents {
         event.setCancellationResult(InteractionResult.SUCCESS);
         event.setCanceled(true);
     }
-
-    @SubscribeEvent
-    public static void onRightClickBlock(PlayerInteractEvent.RightClickBlock event) {
-        if (event.getHand() != InteractionHand.MAIN_HAND) {
-            return;
-        }
-
-        if (event.getLevel().isClientSide) {
-            return;
-        }
-
-        if (!event.getItemStack().is(Items.STICK)) {
-            return;
-        }
-
-        DebugInfo.enable(event.getLevel(), event.getEntity(), 10);
-        event.setCancellationResult(InteractionResult.SUCCESS);
-        event.setCanceled(true);
-    }
 }
