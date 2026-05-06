@@ -6,12 +6,15 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import com.beeboee.createunderpressure.pressure.TankPressureService;
+import com.beeboee.createunderpressure.pressure.TankQoLService;
 import com.simibubi.create.content.fluids.tank.FluidTankBlockEntity;
 
 @Mixin(FluidTankBlockEntity.class)
 public abstract class FluidTankBlockEntityMixin {
     @Inject(method = "tick", at = @At("TAIL"), remap = false)
     private void createUnderPressure$tickPressure(CallbackInfo ci) {
-        TankPressureService.tickTank((FluidTankBlockEntity) (Object) this);
+        FluidTankBlockEntity tank = (FluidTankBlockEntity) (Object) this;
+        TankPressureService.tickTank(tank);
+        TankQoLService.tickTank(tank);
     }
 }
