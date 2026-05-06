@@ -173,9 +173,30 @@ public final class TankPressureService {
         for (End target : targets) {
             if (!usedTargets.add(target.pipe.relative(target.face))) continue;
             List<Step> path = path(level, scan, source, target.pipe);
-            if (path != null) routes.add(new Route(target, path));
+            if (path == null) continue;
+            if (blockedByEarlierReceivingTank(scan, source, target, path)) continue;
+            routes.add(new Route(target, path));
         }
         return routes;
+    }
+
+    private static boolean blockedByEarlierReceivingTank(Scan scan, End source, End target, List<Step> path) {
+        for (End blocker : scan.ends) {
+            if (blocker.tank == null || !blocker.receives) continue;
+            if (sameTank(blocker, source) || sameTank(blocker, target)) continue;
+            if (!compatible(source, blocker)) continue;
+            if (!tankBlocksPath(source, blocker.tank)) continue;
+            if (blocksAlongPath(blocker, path)) return true;
+        }
+        return false;
+    }
+
+    private static boolean blocksAlongPath(End blocker, List<Step> path) {
+        for (Step step : path) {
+            if (blocker.pipe.equals(step.from) && blocker.face == step.fromFace) return true;
+            if (blocker.pipe.equals(step.to)) return true;
+        }
+        return false;
     }
 
     private static boolean ownsPipeNetwork(Scan scan, BlockPos seed) {
