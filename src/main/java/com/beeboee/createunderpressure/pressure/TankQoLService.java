@@ -25,12 +25,6 @@ public final class TankQoLService {
     private static final int TICK_INTERVAL = 5;
     private static final int MAX_DISTANCE = 96;
     private static final int EDGE_CLEANUP_MB = 5;
-    private static final int BOOST_MIN_DELTA_MB = 64;
-    private static final int WATER_BOOST_CAP_MB = 100;
-    private static final int LAVA_BOOST_CAP_MB = 25;
-    private static final double WATER_BOOST_FACTOR = 0.12;
-    private static final double LAVA_BOOST_FACTOR = 0.04;
-    private static final double BOOST_FULL_HEAD = 2.0;
 
     public static void tickTank(FluidTankBlockEntity tickTank) {
         Level level = tickTank.getLevel();
@@ -45,15 +39,14 @@ public final class TankQoLService {
         if (groupFluid == null || groupFluid.isEmpty()) return;
 
         Random random = new Random(level.getGameTime() ^ tickTank.getController().asLong());
-        int cleaned = cleanupEdges(level, network.tanks, random);
-        int boosted = boostLargeDifferences(level, network.tanks, groupFluid, random);
+        int cleaned = cleanupEdges(network.tanks, random);
 
-        if (cleaned > 0 || boosted > 0) {
-            DebugInfo.log(level, "TANK qol source={} tanks={} cleanup={} boosted={}", tickTank.getController(), network.tanks.size(), cleaned, boosted);
+        if (cleaned > 0) {
+            DebugInfo.log(level, "TANK qol source={} tanks={} cleanup={}", tickTank.getController(), network.tanks.size(), cleaned);
         }
     }
 
-    private static int cleanupEdges(Level level, List<FluidTankBlockEntity> tanks, Random random) {
+    private static int cleanupEdges(List<FluidTankBlockEntity> tanks, Random random) {
         List<FluidTankBlockEntity> shuffled = new ArrayList<>(tanks);
         Collections.shuffle(shuffled, random);
 
@@ -94,63 +87,6 @@ public final class TankQoLService {
             if (moved > 0) return moved;
         }
         return 0;
-    }
-
-    private static int boostLargeDifferences(Level level, List<FluidTankBlockEntity> tanks, FluidStack groupFluid, Random random) {
-        int totalFluid = 0;
-        for (FluidTankBlockEntity tank : tanks) totalFluid += tank.getTankInventory().getFluidAmount();
-        if (totalFluid <= 0) return 0;
-
-        boolean lava = groupFluid.getFluid().toString().contains("lava");
-        int cap = lava ? LAVA_BOOST_CAP_MB : WATER_BOOST_CAP_MB;
-        double factor = lava ? LAVA_BOOST_FACTOR : WATER_BOOST_FACTOR;
-        double targetSurface = sharedSurface(tanks, totalFluid);
-
-        List<TankDelta> surplus = new ArrayList<>();
-        List<TankDelta> deficit = new ArrayList<>();
-        for (FluidTankBlockEntity tank : tanks) {
-            int current = tank.getTankInventory().getFluidAmount();
-            int target = amountForSurface(tank, targetSurface);
-            int delta = target - current;
-            if (delta >= BOOST_MIN_DELTA_MB) deficit.add(new TankDelta(tank, surface(tank), delta));
-            if (delta <= -BOOST_MIN_DELTA_MB) surplus.add(new TankDelta(tank, surface(tank), -delta));
-        }
-
-        if (surplus.isEmpty() || deficit.isEmpty()) return 0;
-
-        surplus.sort((a, b) -> Double.compare(b.surface, a.surface));
-        deficit.sort((a, b) -> Double.compare(a.surface, b.surface));
-
-        // Slightly randomize equal-priority networks so tiny leftovers do not always come from the same tank.
-        if (random.nextBoolean()) Collections.reverse(surplus);
-        if (random.nextBoolean()) Collections.reverse(deficit);
-
-        int movedTotal = 0;
-        int budget = cap;
-        for (TankDelta to : deficit) {
-            if (budget <= 0) break;
-            int wanted = plannedBoostMove(to, targetSurface, factor, budget);
-            for (TankDelta from : surplus) {
-                if (budget <= 0 || wanted <= 0) break;
-                if (from.amount <= 0) continue;
-                int requested = Math.min(Math.min(wanted, from.amount), budget);
-                int moved = moveFluid(from.tank, to.tank, requested);
-                if (moved <= 0) continue;
-                from.amount -= moved;
-                wanted -= moved;
-                budget -= moved;
-                movedTotal += moved;
-            }
-        }
-
-        return movedTotal;
-    }
-
-    private static int plannedBoostMove(TankDelta delta, double targetSurface, double factor, int cap) {
-        double head = Math.abs(delta.surface - targetSurface);
-        double multiplier = Math.min(1.0, head / BOOST_FULL_HEAD);
-        int planned = (int) Math.ceil(delta.amount * factor * multiplier);
-        return Math.max(1, Math.min(Math.min(delta.amount, cap), planned));
     }
 
     private static int moveFluid(FluidTankBlockEntity from, FluidTankBlockEntity to, int amount) {
@@ -265,47 +201,6 @@ public final class TankQoLService {
         return controller == null ? tank : controller;
     }
 
-    private static double sharedSurface(List<FluidTankBlockEntity> tanks, int totalFluid) {
-        double low = Double.MAX_VALUE;
-        double high = -Double.MAX_VALUE;
-        for (FluidTankBlockEntity tank : tanks) {
-            double bottom = tank.getController().getY();
-            low = Math.min(low, bottom);
-            high = Math.max(high, bottom + tank.getHeight());
-        }
-
-        for (int i = 0; i < 48; i++) {
-            double mid = (low + high) / 2.0;
-            double volume = 0.0;
-            for (FluidTankBlockEntity tank : tanks) volume += amountAtSurface(tank, mid);
-            if (volume < totalFluid) low = mid;
-            else high = mid;
-        }
-        return (low + high) / 2.0;
-    }
-
-    private static double amountAtSurface(FluidTankBlockEntity tank, double surfaceY) {
-        double filledHeight = Math.max(0.0, Math.min(tank.getHeight(), surfaceY - tank.getController().getY()));
-        return filledHeight * layerCapacity(tank);
-    }
-
-    private static int amountForSurface(FluidTankBlockEntity tank, double surfaceY) {
-        int capacity = tank.getTankInventory().getCapacity();
-        return Math.max(0, Math.min(capacity, (int) Math.round(amountAtSurface(tank, surfaceY))));
-    }
-
-    private static double surface(FluidTankBlockEntity tank) {
-        int amount = tank.getTankInventory().getFluidAmount();
-        if (amount <= 0) return tank.getController().getY();
-        return tank.getController().getY() + (amount / layerCapacity(tank));
-    }
-
-    private static double layerCapacity(FluidTankBlockEntity tank) {
-        int capacity = tank.getTankInventory().getCapacity();
-        int height = Math.max(1, tank.getHeight());
-        return (double) capacity / (double) height;
-    }
-
     private static boolean sameTank(FluidTankBlockEntity a, FluidTankBlockEntity b) {
         return a.getController().equals(b.getController());
     }
@@ -317,16 +212,4 @@ public final class TankQoLService {
     }
 
     private record TankNetwork(List<FluidTankBlockEntity> tanks, FluidTankBlockEntity owner) {}
-
-    private static final class TankDelta {
-        final FluidTankBlockEntity tank;
-        final double surface;
-        int amount;
-
-        TankDelta(FluidTankBlockEntity tank, double surface, int amount) {
-            this.tank = tank;
-            this.surface = surface;
-            this.amount = amount;
-        }
-    }
 }
