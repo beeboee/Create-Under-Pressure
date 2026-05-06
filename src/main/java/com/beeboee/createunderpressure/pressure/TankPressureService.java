@@ -22,7 +22,7 @@ public final class TankPressureService {
 
     private static final int TICK_INTERVAL = 5;
     private static final int MAX_DISTANCE = 96;
-    private static final float PRESSURE_PER_BLOCK = 4.0f;
+    private static final float PRESSURE_PER_BLOCK = 8.0f;
     private static final float MIN_PRESSURE = 16.0f;
     private static final float MAX_PRESSURE = 256.0f;
     private static final double EPSILON = 0.01;
@@ -41,23 +41,22 @@ public final class TankPressureService {
             alreadyScanned.addAll(scan.pipes);
 
             End source = bestSource(scan);
-            if (source == null || source.tank == null || !source.tank.getController().equals(tank.getController())) continue;
+            if (source == null) continue;
 
             End target = bestTarget(scan, source);
             if (target == null) {
-                clearPressure(level, scan);
                 CreateUnderPressure.LOGGER.info("NETWORK idle source={} surface={} endpoints={}", source.name(), source.surface, scan.ends.size());
                 continue;
             }
 
+            if (!belongsToTank(source, tank) && !belongsToTank(target, tank)) continue;
+
             List<Step> path = path(level, scan, source.pipe, target.pipe);
             if (path == null) {
-                clearPressure(level, scan);
                 CreateUnderPressure.LOGGER.info("NETWORK blocked source={} target={}", source.name(), target.name());
                 continue;
             }
 
-            clearPressure(level, scan);
             apply(level, source, target, path);
         }
     }
@@ -95,7 +94,8 @@ public final class TankPressureService {
 
                 boolean fluidCap = FluidPropagator.hasFluidCapability(level, other, face.getOpposite());
                 boolean openEnd = FluidPropagator.isOpenEnd(level, node.pos, face);
-                if (fluidCap || openEnd) ends.add(End.external(node.pos, face, other.getY(), fluidCap, openEnd));
+                boolean sourceBlock = openEnd && level.getFluidState(other).isSource();
+                if (fluidCap || openEnd) ends.add(End.external(node.pos, face, other.getY(), fluidCap, openEnd, sourceBlock));
             }
         }
 
@@ -141,6 +141,10 @@ public final class TankPressureService {
         return a.tank != null && b.tank != null && a.tank.getController().equals(b.tank.getController());
     }
 
+    private static boolean belongsToTank(End end, FluidTankBlockEntity tank) {
+        return end.tank != null && end.tank.getController().equals(tank.getController());
+    }
+
     private static List<Step> path(Level level, Scan scan, BlockPos source, BlockPos target) {
         Map<BlockPos, Step> from = new HashMap<>();
         Set<BlockPos> visited = new HashSet<>();
@@ -173,13 +177,6 @@ public final class TankPressureService {
         List<Step> out = new ArrayList<>();
         for (int i = reversed.size() - 1; i >= 0; i--) out.add(reversed.get(i));
         return out;
-    }
-
-    private static void clearPressure(Level level, Scan scan) {
-        for (BlockPos pipePos : scan.pipes) {
-            FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, pipePos);
-            if (pipe != null) pipe.wipePressure();
-        }
     }
 
     private static void apply(Level level, End source, End target, List<Step> path) {
@@ -255,8 +252,8 @@ public final class TankPressureService {
             return new End(pipe, face, tank, surface(tank), amount > 0, amount < capacity, false);
         }
 
-        static End external(BlockPos pipe, Direction face, double y, boolean fluidCap, boolean openEnd) {
-            return new End(pipe, face, null, y, false, fluidCap || openEnd, openEnd);
+        static End external(BlockPos pipe, Direction face, double y, boolean fluidCap, boolean openEnd, boolean sourceBlock) {
+            return new End(pipe, face, null, y + (sourceBlock ? 1.0 : 0.0), sourceBlock, fluidCap || openEnd, openEnd);
         }
 
         String name() {
