@@ -4,11 +4,17 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.item.Items;
 import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.neoforge.event.ServerChatEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
 import net.neoforged.neoforge.event.tick.LevelTickEvent;
 
 public final class DebugStickEvents {
     private DebugStickEvents() {}
+
+    @SubscribeEvent
+    public static void onServerChat(ServerChatEvent event) {
+        DebugInfo.rememberChat(event.getPlayer(), event.getMessage().getString());
+    }
 
     @SubscribeEvent
     public static void onRightClickItem(PlayerInteractEvent.RightClickItem event) {
