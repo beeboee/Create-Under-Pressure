@@ -23,9 +23,10 @@ public final class TankPressureService {
 
     private static final int TICK_INTERVAL = 5;
     private static final int MAX_DISTANCE = 96;
-    private static final float PRESSURE_PER_BLOCK = 8.0f;
     private static final float MIN_PRESSURE = 16.0f;
     private static final float MAX_PRESSURE = 256.0f;
+    private static final double MIN_HEAD = 0.5;
+    private static final double MAX_HEAD = 32.0;
     private static final double EPSILON = 0.01;
 
     public static void tickTank(FluidTankBlockEntity tank) {
@@ -134,7 +135,7 @@ public final class TankPressureService {
         for (End end : scan.ends) {
             if (!end.receives) continue;
             if (sameTank(source, end)) continue;
-            if (end.surface >= source.surface - EPSILON) continue;
+            if (end.surface >= source.surface - MIN_HEAD) continue;
             targets.add(end);
         }
         targets.sort(Comparator.comparingDouble((End end) -> end.surface).thenComparingInt(end -> end.pipe.getY()));
@@ -213,8 +214,8 @@ public final class TankPressureService {
 
     private static void apply(Level level, End source, End target, List<Step> path, float share) {
         double head = source.surface - target.surface;
-        if (head <= EPSILON) return;
         float pressure = pressureForHead(head) * share;
+        if (pressure <= 0) return;
         Map<BlockPos, Map<Direction, Boolean>> graph = new HashMap<>();
 
         graph.computeIfAbsent(source.pipe, $ -> new IdentityHashMap<>()).put(source.face, true);
@@ -239,9 +240,9 @@ public final class TankPressureService {
     }
 
     private static float pressureForHead(double head) {
-        float pressure = (float) Math.min(MAX_PRESSURE, head * PRESSURE_PER_BLOCK);
-        if (head >= 1.0) return Math.max(MIN_PRESSURE, pressure);
-        return pressure;
+        if (head < MIN_HEAD) return 0.0f;
+        double t = Math.min(1.0, (head - MIN_HEAD) / (MAX_HEAD - MIN_HEAD));
+        return (float) (MIN_PRESSURE + (t * (MAX_PRESSURE - MIN_PRESSURE)));
     }
 
     private static FluidTankBlockEntity tankAt(Level level, BlockPos pos) {
