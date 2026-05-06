@@ -3,7 +3,8 @@
   "package": "com.beeboee.createunderpressure.mixin",
   "compatibilityLevel": "JAVA_21",
   "mixins": [
-    "FluidTankBlockEntityMixin"
+    "FluidTankBlockEntityMixin",
+    "FluidTransportBehaviourMixin"
   ],
   "injectors": {
     "defaultRequire": 1
