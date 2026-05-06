@@ -151,15 +151,26 @@ public final class TankPressureService {
     private static List<End> targets(Scan scan, End source) {
         List<End> targets = new ArrayList<>();
         for (End end : scan.ends) {
-            if (!end.receives) continue;
-            if (sameTank(source, end)) continue;
-            if (!compatible(source, end)) continue;
-            double requiredHead = tankToTank(source, end) ? TANK_SETTLE_HEAD : DEAD_HEAD;
-            if (end.surface >= source.surface - requiredHead) continue;
+            if (!canReceiveFrom(source, end)) continue;
+            if (!isLowerEnough(source, end)) continue;
             targets.add(end);
         }
         targets.sort(Comparator.comparingDouble((End end) -> source.surface - end.surface).reversed().thenComparingInt(end -> end.pipe.getY()));
         return targets;
+    }
+
+    private static boolean canReceiveFrom(End source, End target) {
+        if (!target.receives) return false;
+        if (sameTank(source, target)) return false;
+        return compatible(source, target);
+    }
+
+    private static boolean isLowerEnough(End source, End target) {
+        return target.surface < source.surface - requiredHead(source, target);
+    }
+
+    private static double requiredHead(End source, End target) {
+        return tankToTank(source, target) ? TANK_SETTLE_HEAD : DEAD_HEAD;
     }
 
     private static boolean compatible(End source, End target) {
@@ -178,25 +189,70 @@ public final class TankPressureService {
         List<Route> routes = new ArrayList<>();
         Set<BlockPos> usedTargets = new HashSet<>();
         for (End target : targets) {
-            if (!usedTargets.add(target.pipe.relative(target.face))) continue;
             List<Step> path = path(level, scan, source, target.pipe);
             if (path == null) continue;
-            if (blockedByEarlierReceivingTank(scan, source, target, path)) continue;
-            routes.add(new Route(target, path));
-            if (tankToTank(source, target)) break;
+
+            End effectiveTarget = effectiveTarget(scan, source, target, path);
+            if (effectiveTarget == null) continue;
+            if (!targetOwnsReceiver(scan, source, effectiveTarget)) continue;
+            if (!usedTargets.add(effectiveTarget.pipe.relative(effectiveTarget.face))) continue;
+
+            List<Step> effectivePath = effectiveTarget == target ? path : path(level, scan, source, effectiveTarget.pipe);
+            if (effectivePath == null) continue;
+
+            routes.add(new Route(effectiveTarget, effectivePath));
+            if (tankToTank(source, effectiveTarget)) break;
         }
         return routes;
     }
 
-    private static boolean blockedByEarlierReceivingTank(Scan scan, End source, End target, List<Step> path) {
+    private static End effectiveTarget(Scan scan, End source, End target, List<Step> path) {
+        End blocker = firstBlockingTankAlongPath(scan, source, target, path);
+        return blocker == null ? target : blocker;
+    }
+
+    private static End firstBlockingTankAlongPath(Scan scan, End source, End target, List<Step> path) {
+        End best = null;
         for (End blocker : scan.ends) {
-            if (blocker.tank == null || !blocker.receives) continue;
-            if (sameTank(blocker, source) || sameTank(blocker, target)) continue;
-            if (!compatible(source, blocker)) continue;
-            if (!tankBlocksPath(source, blocker.tank)) continue;
-            if (blocksAlongPath(blocker, path)) return true;
+            if (blocker.tank == null) continue;
+            if (!canReceiveFrom(source, blocker)) continue;
+            if (!isLowerEnough(source, blocker)) continue;
+            if (sameTank(blocker, target)) continue;
+            if (!blocksAlongPath(blocker, path)) continue;
+            if (best == null || pathIndex(blocker, path) < pathIndex(best, path)) best = blocker;
         }
-        return false;
+        return best;
+    }
+
+    private static int pathIndex(End blocker, List<Step> path) {
+        for (int i = 0; i < path.size(); i++) {
+            Step step = path.get(i);
+            if (blocker.pipe.equals(step.from) && blocker.face == step.fromFace) return i;
+            if (blocker.pipe.equals(step.to)) return i;
+        }
+        return Integer.MAX_VALUE;
+    }
+
+    private static boolean targetOwnsReceiver(Scan scan, End source, End target) {
+        if (target.tank == null) return true;
+        for (End otherSource : scan.ends) {
+            if (otherSource == source) continue;
+            if (!otherSource.provides) continue;
+            if (!canReceiveFrom(otherSource, target)) continue;
+            if (!isLowerEnough(otherSource, target)) continue;
+            if (sourceBeats(source, otherSource, target)) continue;
+            DebugInfo.log(null, "");
+            return false;
+        }
+        return true;
+    }
+
+    private static boolean sourceBeats(End source, End challenger, End target) {
+        double sourceHead = source.surface - target.surface;
+        double challengerHead = challenger.surface - target.surface;
+        if (sourceHead > challengerHead + EPSILON) return true;
+        if (challengerHead > sourceHead + EPSILON) return false;
+        return compareBlockPos(source.pipe, challenger.pipe) <= 0;
     }
 
     private static boolean blocksAlongPath(End blocker, List<Step> path) {
@@ -281,7 +337,7 @@ public final class TankPressureService {
     private static boolean tankBlocksPath(End source, FluidTankBlockEntity tank) {
         if (source.tank != null && source.tank.getController().equals(tank.getController())) return false;
         if (tank.getTankInventory().getFluidAmount() >= tank.getTankInventory().getCapacity()) return false;
-        if (surface(tank) >= source.surface - DEAD_HEAD) return false;
+        if (surface(tank) >= source.surface - TANK_SETTLE_HEAD) return false;
         if (source.tank == null) return true;
 
         FluidStack sourceFluid = source.tank.getTankInventory().getFluid();
