@@ -546,6 +546,25 @@ public final class TankPressureService {
         return tank.getController().getY() + (amount / layerCapacity(tank));
     }
 
+    private static double sourceCutoffSurface(BlockPos pipe, Direction face, FluidTankBlockEntity tank) {
+        BlockPos tankBlock = pipe.relative(face);
+        double bottom = tank.getController().getY();
+        double top = bottom + tank.getHeight();
+        double cutoff = switch (face) {
+            case UP -> tankBlock.getY();
+            case DOWN -> tankBlock.getY() + 1.0;
+            default -> tankBlock.getY();
+        };
+        return Math.max(bottom, Math.min(top, cutoff));
+    }
+
+    private static boolean tankCanProvideToPipe(BlockPos pipe, Direction face, FluidTankBlockEntity tank) {
+        int amount = tank.getTankInventory().getFluidAmount();
+        if (amount <= 0) return false;
+        double cutoffSurface = sourceCutoffSurface(pipe, face, tank);
+        return surface(tank) > cutoffSurface + EPSILON && amount > amountForSurface(tank, cutoffSurface);
+    }
+
     private static double layerCapacity(FluidTankBlockEntity tank) {
         int capacity = tank.getTankInventory().getCapacity();
         int height = Math.max(1, tank.getHeight());
@@ -592,7 +611,7 @@ public final class TankPressureService {
         static End tank(BlockPos pipe, Direction face, FluidTankBlockEntity tank) {
             int amount = tank.getTankInventory().getFluidAmount();
             int capacity = tank.getTankInventory().getCapacity();
-            return new End(pipe, face, tank, surface(tank), amount > 0, amount < capacity, false);
+            return new End(pipe, face, tank, surface(tank), tankCanProvideToPipe(pipe, face, tank), amount < capacity, false);
         }
 
         static End external(BlockPos pipe, Direction face, double y, boolean fluidCap, boolean openEnd, boolean sourceBlock) {
