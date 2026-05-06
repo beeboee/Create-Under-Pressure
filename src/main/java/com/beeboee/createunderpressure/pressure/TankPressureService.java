@@ -17,6 +17,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.Fluids;
 import net.neoforged.neoforge.fluids.FluidStack;
 import net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction;
 
@@ -26,8 +27,11 @@ public final class TankPressureService {
     private static final int TICK_INTERVAL = 5;
     private static final int MAX_DISTANCE = 96;
     private static final int TANK_TRANSFER_CAP_MB = 100;
+    private static final int LAVA_TANK_TRANSFER_CAP_MB = 25;
     private static final int TANK_TRANSFER_EPSILON_MB = 5;
     private static final double TANK_TRANSFER_FACTOR = 0.20;
+    private static final double LAVA_TANK_TRANSFER_FACTOR = 0.08;
+    private static final float LAVA_PRESSURE_MULTIPLIER = 0.35f;
     private static final float TRICKLE_PRESSURE = 8.0f;
     private static final float MIN_PRESSURE = 16.0f;
     private static final float MAX_PRESSURE = 256.0f;
@@ -78,11 +82,17 @@ public final class TankPressureService {
         TankNetwork network = tankNetwork(level, tickTank);
         if (network.tanks.size() < 2) return;
         if (!network.owner.getController().equals(tickTank.getController())) return;
-        if (!singleFluidGroup(network.tanks)) return;
+
+        FluidStack groupFluid = groupFluid(network.tanks);
+        if (groupFluid == null) return;
 
         int totalFluid = 0;
         for (FluidTankBlockEntity tank : network.tanks) totalFluid += tank.getTankInventory().getFluidAmount();
         if (totalFluid <= 0) return;
+
+        boolean lava = isLava(groupFluid);
+        int transferCap = lava ? LAVA_TANK_TRANSFER_CAP_MB : TANK_TRANSFER_CAP_MB;
+        double transferFactor = lava ? LAVA_TANK_TRANSFER_FACTOR : TANK_TRANSFER_FACTOR;
 
         double targetSurface = sharedSurface(network.tanks, totalFluid);
         List<TankDelta> surplus = new ArrayList<>();
@@ -98,18 +108,18 @@ public final class TankPressureService {
 
         if (surplus.isEmpty() || deficit.isEmpty()) return;
 
-        int budget = TANK_TRANSFER_CAP_MB;
+        int budget = transferCap;
         int movedTotal = 0;
         for (TankDelta from : surplus) {
             if (budget <= 0) break;
-            int available = Math.max(1, (int) Math.ceil(from.amount * TANK_TRANSFER_FACTOR));
+            int available = Math.max(1, (int) Math.ceil(from.amount * transferFactor));
             available = Math.min(available, from.amount);
 
             for (TankDelta to : deficit) {
                 if (budget <= 0 || available <= 0) break;
                 if (to.amount <= 0) continue;
 
-                int wanted = Math.max(1, (int) Math.ceil(to.amount * TANK_TRANSFER_FACTOR));
+                int wanted = Math.max(1, (int) Math.ceil(to.amount * transferFactor));
                 wanted = Math.min(wanted, to.amount);
                 int requested = Math.min(Math.min(available, wanted), budget);
 
@@ -123,7 +133,7 @@ public final class TankPressureService {
             }
         }
 
-        if (movedTotal > 0) DebugInfo.log(level, "TANK smooth source={} tanks={} targetSurface={} moved={}", tickTank.getController(), network.tanks.size(), targetSurface, movedTotal);
+        if (movedTotal > 0) DebugInfo.log(level, "TANK smooth source={} fluid={} tanks={} targetSurface={} moved={} cap={} factor={}", tickTank.getController(), groupFluid.getHoverName().getString(), network.tanks.size(), targetSurface, movedTotal, transferCap, transferFactor);
     }
 
     private static int moveFluid(FluidTankBlockEntity from, FluidTankBlockEntity to, int amount) {
@@ -146,7 +156,7 @@ public final class TankPressureService {
         return filled;
     }
 
-    private static boolean singleFluidGroup(List<FluidTankBlockEntity> tanks) {
+    private static FluidStack groupFluid(List<FluidTankBlockEntity> tanks) {
         FluidStack groupFluid = FluidStack.EMPTY;
         for (FluidTankBlockEntity tank : tanks) {
             FluidStack fluid = tank.getTankInventory().getFluid();
@@ -155,9 +165,9 @@ public final class TankPressureService {
                 groupFluid = fluid;
                 continue;
             }
-            if (!FluidStack.isSameFluidSameComponents(groupFluid, fluid)) return false;
+            if (!FluidStack.isSameFluidSameComponents(groupFluid, fluid)) return null;
         }
-        return true;
+        return groupFluid;
     }
 
     private static TankNetwork tankNetwork(Level level, FluidTankBlockEntity start) {
@@ -404,7 +414,7 @@ public final class TankPressureService {
 
     private static void apply(Level level, End source, End target, List<Step> path, float share) {
         double head = source.surface - target.surface;
-        float pressure = pressureForHead(head) * share;
+        float pressure = pressureForHead(head) * share * fluidPressureMultiplier(source);
         if (pressure <= 0) return;
         Map<BlockPos, Map<Direction, Boolean>> graph = new HashMap<>();
 
@@ -427,6 +437,16 @@ public final class TankPressureService {
         }
 
         for (BlockPos pipePos : graph.keySet()) FluidTransportBehaviour.cacheFlows(level, pipePos);
+    }
+
+    private static float fluidPressureMultiplier(End source) {
+        if (source.tank == null) return 1.0f;
+        FluidStack fluid = source.tank.getTankInventory().getFluid();
+        return isLava(fluid) ? LAVA_PRESSURE_MULTIPLIER : 1.0f;
+    }
+
+    private static boolean isLava(FluidStack stack) {
+        return !stack.isEmpty() && stack.getFluid() == Fluids.LAVA;
     }
 
     private static float pressureForHead(double head) {
