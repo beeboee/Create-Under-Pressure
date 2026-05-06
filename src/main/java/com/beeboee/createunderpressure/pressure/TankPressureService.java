@@ -2,16 +2,12 @@ package com.beeboee.createunderpressure.pressure;
 
 import java.util.ArrayDeque;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Set;
 
-import org.jetbrains.annotations.Nullable;
-
 import com.simibubi.create.content.fluids.FluidPropagator;
 import com.simibubi.create.content.fluids.FluidTransportBehaviour;
-import com.simibubi.create.content.fluids.pipes.StraightPipeBlockEntity;
 import com.simibubi.create.content.fluids.tank.FluidTankBlockEntity;
 
 import net.createmod.catnip.data.Pair;
@@ -53,7 +49,7 @@ public final class TankPressureService {
             return;
         }
 
-        if (tank.getTankInventory().isEmpty()) {
+        if (tank.getTankInventory().getFluid().isEmpty()) {
             return;
         }
 
@@ -90,8 +86,7 @@ public final class TankPressureService {
 
     private static void distributePressure(Level level, BlockFace start, int tankBottomY) {
         Map<BlockPos, Pair<Integer, Map<Direction, Boolean>>> pipeGraph = new HashMap<>();
-        Set<BlockFace> validFaces = new HashSet<>();
-        Set<BlockPos> visited = new HashSet<>();
+        Set<BlockPos> visited = new java.util.HashSet<>();
         ArrayDeque<Pair<Integer, BlockPos>> frontier = new ArrayDeque<>();
 
         frontier.add(Pair.of(0, start.getPos()));
@@ -131,22 +126,17 @@ public final class TankPressureService {
                     continue;
                 }
 
-                // Do not allow pressure to lift fluid back up to the tank bottom.
-                if (connectedPos.getY() >= tankBottomY) {
-                    validFaces.add(blockFace);
-                    pipeGraph.computeIfAbsent(currentPos, $ -> Pair.of(distance, new IdentityHashMap<>()))
-                        .getSecond()
-                        .put(face, true);
-                    continue;
-                }
-
                 pipeGraph.computeIfAbsent(currentPos, $ -> Pair.of(distance, new IdentityHashMap<>()))
                     .getSecond()
                     .put(face, true);
 
+                // Do not allow pressure to lift fluid back up to the tank bottom.
+                if (connectedPos.getY() >= tankBottomY) {
+                    continue;
+                }
+
                 FluidTransportBehaviour connectedPipe = FluidPropagator.getPipe(level, connectedPos);
                 if (connectedPipe == null) {
-                    validFaces.add(blockFace);
                     continue;
                 }
 
