@@ -105,7 +105,11 @@ public final class TankPressureService {
             int target = amountForSurface(tank, targetSurface);
             int delta = target - current;
             if (delta > TANK_TRANSFER_EPSILON_MB) deficit.add(new TankDelta(tank, surface(tank), delta));
-            if (delta < -TANK_TRANSFER_EPSILON_MB) surplus.add(new TankDelta(tank, surface(tank), -delta));
+            if (delta < -TANK_TRANSFER_EPSILON_MB) {
+                int drainable = Math.max(0, current - passiveRetainedAmount(level, tank));
+                int availableSurplus = Math.min(-delta, drainable);
+                if (availableSurplus > TANK_TRANSFER_EPSILON_MB) surplus.add(new TankDelta(tank, surface(tank), availableSurplus));
+            }
         }
 
         if (surplus.isEmpty() || deficit.isEmpty()) return;
@@ -145,7 +149,15 @@ public final class TankPressureService {
                     continue;
                 }
 
-                int requested = Math.min(remainingNeed, from.plan);
+                int retained = passiveRetainedAmount(level, from.tank);
+                int drainable = Math.max(0, from.tank.getTankInventory().getFluidAmount() - retained);
+                int requested = Math.min(Math.min(remainingNeed, from.plan), drainable);
+                if (requested <= 0) {
+                    from.plan = 0;
+                    sourceIndex++;
+                    continue;
+                }
+
                 int moved = moveFluid(from.tank, to.tank, requested);
                 if (moved <= 0) {
                     from.plan = 0;
@@ -556,6 +568,23 @@ public final class TankPressureService {
             default -> tankBlock.getY();
         };
         return Math.max(bottom, Math.min(top, cutoff));
+    }
+
+    private static int passiveRetainedAmount(Level level, FluidTankBlockEntity tank) {
+        Set<BlockPos> tankSeeds = seeds(level, tank);
+        if (tankSeeds.isEmpty()) return tank.getTankInventory().getFluidAmount();
+
+        double cutoffSurface = tank.getController().getY() + tank.getHeight();
+        boolean found = false;
+        for (BlockPos pipePos : tankSeeds) {
+            Direction face = faceToTank(level, tank, pipePos);
+            if (face == null) continue;
+            cutoffSurface = Math.min(cutoffSurface, sourceCutoffSurface(pipePos, face, tank));
+            found = true;
+        }
+
+        if (!found) return tank.getTankInventory().getFluidAmount();
+        return amountForSurface(tank, cutoffSurface);
     }
 
     private static boolean tankCanProvideToPipe(BlockPos pipe, Direction face, FluidTankBlockEntity tank) {
