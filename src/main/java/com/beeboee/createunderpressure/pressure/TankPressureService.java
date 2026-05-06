@@ -17,13 +17,17 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
+import net.neoforged.neoforge.fluids.FluidStack;
+import net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction;
 
 public final class TankPressureService {
     private TankPressureService() {}
 
     private static final int TICK_INTERVAL = 5;
     private static final int MAX_DISTANCE = 96;
-    private static final float TRICKLE_PRESSURE = 4.0f;
+    private static final int TANK_EQUALIZE_MB_PER_TICK = 1000;
+    private static final int TANK_EQUALIZE_EPSILON_MB = 25;
+    private static final float TRICKLE_PRESSURE = 8.0f;
     private static final float MIN_PRESSURE = 16.0f;
     private static final float MAX_PRESSURE = 256.0f;
     private static final double DEAD_HEAD = 0.125;
@@ -35,6 +39,8 @@ public final class TankPressureService {
         Level level = tank.getLevel();
         if (level == null || level.isClientSide || !tank.isController()) return;
         if (level.getGameTime() % TICK_INTERVAL != 0) return;
+
+        equalizeConnectedTanks(level, tank);
 
         Set<BlockPos> alreadyScanned = new HashSet<>();
         for (BlockPos seed : seeds(level, tank)) {
@@ -65,6 +71,149 @@ public final class TankPressureService {
             DebugInfo.log(level, "NETWORK split source={} targets={} share={}", source.name(), routes.size(), share);
             for (Route route : routes) apply(level, source, route.target, route.path, share);
         }
+    }
+
+    private static void equalizeConnectedTanks(Level level, FluidTankBlockEntity tickTank) {
+        TankNetwork network = tankNetwork(level, tickTank);
+        if (network.tanks.size() < 2) return;
+        if (!network.owner.getController().equals(tickTank.getController())) return;
+
+        int totalFluid = 0;
+        for (FluidTankBlockEntity tank : network.tanks) totalFluid += tank.getTankInventory().getFluidAmount();
+        if (totalFluid <= 0) return;
+
+        double sharedSurface = sharedSurface(network.tanks, totalFluid);
+        List<TankDelta> surplus = new ArrayList<>();
+        List<TankDelta> deficit = new ArrayList<>();
+
+        for (FluidTankBlockEntity tank : network.tanks) {
+            int current = tank.getTankInventory().getFluidAmount();
+            int target = amountForSurface(tank, sharedSurface);
+            int delta = target - current;
+            if (delta > TANK_EQUALIZE_EPSILON_MB) deficit.add(new TankDelta(tank, delta));
+            if (delta < -TANK_EQUALIZE_EPSILON_MB) surplus.add(new TankDelta(tank, -delta));
+        }
+
+        if (surplus.isEmpty() || deficit.isEmpty()) return;
+
+        int movedTotal = 0;
+        int budget = TANK_EQUALIZE_MB_PER_TICK;
+        for (TankDelta from : surplus) {
+            int available = from.amount;
+            if (budget <= 0) break;
+            for (TankDelta to : deficit) {
+                if (available <= 0 || to.amount <= 0 || budget <= 0) break;
+                int requested = Math.min(Math.min(available, to.amount), budget);
+                int moved = moveFluid(from.tank, to.tank, requested);
+                if (moved <= 0) continue;
+                available -= moved;
+                to.amount -= moved;
+                budget -= moved;
+                movedTotal += moved;
+            }
+        }
+
+        if (movedTotal > 0) DebugInfo.log(level, "TANK equalize tanks={} surface={} moved={}", network.tanks.size(), sharedSurface, movedTotal);
+    }
+
+    private static int moveFluid(FluidTankBlockEntity from, FluidTankBlockEntity to, int amount) {
+        FluidStack simulatedDrain = from.getTankInventory().drain(amount, FluidAction.SIMULATE);
+        if (simulatedDrain.isEmpty()) return 0;
+
+        int canFill = to.getTankInventory().fill(simulatedDrain, FluidAction.SIMULATE);
+        int actual = Math.min(amount, canFill);
+        if (actual <= 0) return 0;
+
+        FluidStack drained = from.getTankInventory().drain(actual, FluidAction.EXECUTE);
+        if (drained.isEmpty()) return 0;
+
+        int filled = to.getTankInventory().fill(drained, FluidAction.EXECUTE);
+        if (filled < drained.getAmount()) {
+            FluidStack remainder = drained.copy();
+            remainder.setAmount(drained.getAmount() - filled);
+            from.getTankInventory().fill(remainder, FluidAction.EXECUTE);
+        }
+        return filled;
+    }
+
+    private static TankNetwork tankNetwork(Level level, FluidTankBlockEntity start) {
+        Map<BlockPos, FluidTankBlockEntity> tanks = new HashMap<>();
+        Set<BlockPos> pipes = new HashSet<>();
+        ArrayDeque<FluidTankBlockEntity> tankQueue = new ArrayDeque<>();
+        ArrayDeque<BlockPos> pipeQueue = new ArrayDeque<>();
+
+        addTank(tanks, tankQueue, start);
+
+        while (!tankQueue.isEmpty() || !pipeQueue.isEmpty()) {
+            while (!tankQueue.isEmpty()) {
+                FluidTankBlockEntity tank = tankQueue.removeFirst();
+                for (BlockPos seed : seeds(level, tank)) {
+                    if (pipes.add(seed)) pipeQueue.add(seed);
+                }
+            }
+
+            while (!pipeQueue.isEmpty()) {
+                BlockPos pipePos = pipeQueue.removeFirst();
+                FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, pipePos);
+                if (pipe == null) continue;
+
+                for (Direction face : FluidPropagator.getPipeConnections(level.getBlockState(pipePos), pipe)) {
+                    BlockPos other = pipePos.relative(face);
+                    FluidTankBlockEntity tank = tankAt(level, other);
+                    if (tank != null) {
+                        addTank(tanks, tankQueue, tank);
+                        continue;
+                    }
+
+                    if (level.isLoaded(other) && FluidPropagator.getPipe(level, other) != null && pipes.add(other)) pipeQueue.add(other);
+                }
+            }
+        }
+
+        FluidTankBlockEntity owner = null;
+        for (FluidTankBlockEntity tank : tanks.values()) {
+            if (owner == null || compareBlockPos(tank.getController(), owner.getController()) < 0) owner = tank;
+        }
+        return new TankNetwork(new ArrayList<>(tanks.values()), owner == null ? start : owner);
+    }
+
+    private static void addTank(Map<BlockPos, FluidTankBlockEntity> tanks, ArrayDeque<FluidTankBlockEntity> queue, FluidTankBlockEntity tank) {
+        FluidTankBlockEntity controller = tank.isController() ? tank : tank.getControllerBE();
+        if (controller == null) controller = tank;
+        if (tanks.putIfAbsent(controller.getController(), controller) == null) queue.add(controller);
+    }
+
+    private static double sharedSurface(List<FluidTankBlockEntity> tanks, int totalFluid) {
+        double low = Double.MAX_VALUE;
+        double high = -Double.MAX_VALUE;
+        for (FluidTankBlockEntity tank : tanks) {
+            double bottom = tank.getController().getY();
+            low = Math.min(low, bottom);
+            high = Math.max(high, bottom + tank.getHeight());
+        }
+
+        for (int i = 0; i < 48; i++) {
+            double mid = (low + high) / 2.0;
+            double volume = volumeAtSurface(tanks, mid);
+            if (volume < totalFluid) low = mid;
+            else high = mid;
+        }
+        return (low + high) / 2.0;
+    }
+
+    private static double volumeAtSurface(List<FluidTankBlockEntity> tanks, double surfaceY) {
+        double total = 0;
+        for (FluidTankBlockEntity tank : tanks) {
+            double filledHeight = Math.max(0, Math.min(tank.getHeight(), surfaceY - tank.getController().getY()));
+            total += filledHeight * layerCapacity(tank);
+        }
+        return total;
+    }
+
+    private static int amountForSurface(FluidTankBlockEntity tank, double surfaceY) {
+        double filledHeight = Math.max(0, Math.min(tank.getHeight(), surfaceY - tank.getController().getY()));
+        int capacity = tank.getTankInventory().getCapacity();
+        return Math.max(0, Math.min(capacity, (int) Math.round(filledHeight * layerCapacity(tank))));
     }
 
     private static Scan scan(Level level, BlockPos seed) {
@@ -112,11 +261,13 @@ public final class TankPressureService {
         Set<BlockPos> seeds = new HashSet<>();
         BlockPos base = tank.getController();
         for (int x = 0; x < tank.getWidth(); x++) {
-            for (int z = 0; z < tank.getWidth(); z++) {
-                BlockPos tankBlock = base.offset(x, 0, z);
-                for (Direction direction : Direction.values()) {
-                    BlockPos pipePos = tankBlock.relative(direction);
-                    if (level.isLoaded(pipePos) && FluidPropagator.getPipe(level, pipePos) != null) seeds.add(pipePos);
+            for (int y = 0; y < tank.getHeight(); y++) {
+                for (int z = 0; z < tank.getWidth(); z++) {
+                    BlockPos tankBlock = base.offset(x, y, z);
+                    for (Direction direction : Direction.values()) {
+                        BlockPos pipePos = tankBlock.relative(direction);
+                        if (level.isLoaded(pipePos) && FluidPropagator.getPipe(level, pipePos) != null) seeds.add(pipePos);
+                    }
                 }
             }
         }
@@ -137,6 +288,7 @@ public final class TankPressureService {
         for (End end : scan.ends) {
             if (!end.receives) continue;
             if (sameTank(source, end)) continue;
+            if (source.tank != null && end.tank != null) continue;
             if (end.surface >= source.surface - DEAD_HEAD) continue;
             targets.add(end);
         }
@@ -245,7 +397,7 @@ public final class TankPressureService {
         if (head < DEAD_HEAD) return 0.0f;
         if (head < TRICKLE_HEAD) {
             double t = (head - DEAD_HEAD) / (TRICKLE_HEAD - DEAD_HEAD);
-            return (float) (TRICKLE_PRESSURE * t * t);
+            return (float) (TRICKLE_PRESSURE * t * (2.0 - t));
         }
         double t = Math.min(1.0, (head - TRICKLE_HEAD) / (MAX_HEAD - TRICKLE_HEAD));
         return (float) (MIN_PRESSURE + (t * t * (MAX_PRESSURE - MIN_PRESSURE)));
@@ -273,6 +425,16 @@ public final class TankPressureService {
     private record Node(BlockPos pos, int distance) {}
     private record Step(BlockPos from, Direction face, BlockPos to) {}
     private record Route(End target, List<Step> path) {}
+    private record TankNetwork(List<FluidTankBlockEntity> tanks, FluidTankBlockEntity owner) {}
+    private static final class TankDelta {
+        final FluidTankBlockEntity tank;
+        int amount;
+
+        TankDelta(FluidTankBlockEntity tank, int amount) {
+            this.tank = tank;
+            this.amount = amount;
+        }
+    }
 
     private static final class End {
         final BlockPos pipe;
