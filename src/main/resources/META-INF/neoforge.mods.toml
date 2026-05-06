@@ -1,0 +1,35 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="MIT"
+
+[[mods]]
+modId="create_under_pressure"
+version="0.1.0"
+displayName="Create: Under Pressure"
+description='''
+Adds fluid pressure to Create's existing pipe and fluid systems.
+'''
+
+[[mixins]]
+config="create_under_pressure.mixins.json"
+
+[[dependencies.create_under_pressure]]
+modId="neoforge"
+type="required"
+versionRange="[21.1.227,)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.create_under_pressure]]
+modId="minecraft"
+type="required"
+versionRange="[1.21.1,1.22)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.create_under_pressure]]
+modId="create"
+type="required"
+versionRange="[6.0.10,6.1.0)"
+ordering="AFTER"
+side="BOTH"
