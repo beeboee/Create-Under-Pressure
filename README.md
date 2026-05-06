@@ -1,71 +1,88 @@
 # Create: Under Pressure
 
-A Create addon for Minecraft 1.21.1 / NeoForge that adds gravity-fed head pressure and fluid-driven kinetic generation.
+A Create addon about making fluids feel heavy.
 
-## Target
+The basic idea is simple: if you build a tank or reservoir above your machinery, that height should matter. Water should be able to push downward through pipes. Lava should churn out slower, stronger power. A machine that is overstressed should stop the flow instead of letting fluid magically pass through anyway.
 
-- Minecraft: `1.21.1`
-- NeoForge: `21.1.227`
-- Create: `6.0.10`
-- Java: `21`
+This is being built for:
 
-## Core idea
+- Minecraft `1.21.1`
+- NeoForge `21.1.227`
+- Create `6.0.10`
+- Java `21`
 
-Create already has good pipe mechanics. This mod should not replace Create pipes unless there is no practical alternative.
+## Planned features
 
-Instead, the mod adds pressure-aware behavior around existing Create fluid infrastructure:
+### Head pressure
 
-- tanks or source fluids above an outlet/turbine create head pressure
-- flowing fluids can generate rotational power through a turbine
-- fluid movement stops when the connected kinetic network is overstressed
-- water is faster but weaker
-- lava is slower but stronger
+Fluid above a pipe, outlet, or turbine can create pressure below it.
 
-## Main block: Head Turbine
+A tall tank should feel different from a tank sitting on the floor. Same fluid, more height, more push.
 
-The Head Turbine acts like an inverse hose pulley.
+### Head Turbine
 
-- Hose pulley: rotation moves fluid.
-- Head turbine: fluid movement creates rotation.
+The main planned block is the **Head Turbine**.
 
-The turbine looks upstream for usable pressure, consumes fluid when appropriate, and outputs Create rotational power.
+Think of it like a hose pulley in reverse:
 
-For world fluids:
+- a hose pulley uses rotation to move fluid
+- a head turbine uses moving fluid to make rotation
 
-- below the infinite-fluid-body threshold, source blocks are consumed upstream
-- above the infinite-fluid-body threshold, the fluid body behaves as renewable
-- output is still limited by head height, fluid type, and config
+Put fluid above it, give that fluid somewhere to go, and the turbine generates Create rotational power.
 
-## Mixin policy
+### Water vs lava
 
-Mixins are allowed and probably necessary, but they must stay narrow.
+Water and lava should not feel like copy-pasted fluids.
 
-Do not scatter Mixins through gameplay logic.
+Planned behavior:
 
-Use this shape instead:
+- **Water**: faster RPM, lower stress capacity
+- **Lava**: slower RPM, higher stress capacity
 
-```text
-our turbine/block logic
-  -> pressure service
-    -> Create integration adapter
-      -> small Mixins/accessors where Create has no public API
-```
+So water is better for speed, lava is better for heavier machines.
 
-That gives the mod a stable internal design even if Create internals move later.
+### Source block behavior
 
-## Early scope
+For world fluids, the turbine should behave a bit like an inverse hose pulley.
 
-1. Compileable NeoForge/Create scaffold.
-2. Head Turbine registration and placeholder block entity.
-3. Pressure math separated from Create internals.
-4. Create integration adapter.
-5. Narrow Mixins/accessors for pipe/hose-pulley/fluid-network internals.
-6. Real turbine behavior.
+Small pools should get drained. Big enough bodies should count as renewable, using Create/Minecraft's infinite-fluid behavior where possible.
 
-## Avoid early
+That means a tiny floating puddle should not become a free infinite power plant, but a real reservoir should work.
 
-- new custom pipe network
-- full pressure simulation per pipe segment
+### Overstress stops flow
+
+If the turbine is connected to an overstressed kinetic network, the turbine should stop and the fluid should stop moving.
+
+No free fluid transfer through a jammed machine.
+
+## What this mod is not trying to do
+
+At least for now, this is not trying to add a whole new pipe system.
+
+Create already has pipes. The goal is to make pressure interact with Create's existing fluid machinery, not reinvent everything from scratch.
+
+Also probably not v1 stuff:
+
 - pipe bursting
+- full fluid simulation per pipe segment
+- custom pressure pipe blocks
 - infinite turbine chains
-- broad invasive Mixins
+- complicated real-world fluid physics
+
+## Development plan
+
+First goal: get a simple Head Turbine working in a tiny test setup.
+
+After that:
+
+1. Add pressure math.
+2. Detect valid upstream fluid sources.
+3. Consume source blocks when appropriate.
+4. Generate RPM/stress based on fluid type and head height.
+5. Hook into Create's pipe/fluid behavior carefully.
+
+Mixins will probably be needed, but they should be small and focused. The mod should use Create's systems where it can and only patch internals where it has to.
+
+## Status
+
+Early planning/scaffold stage. Nothing playable yet.
