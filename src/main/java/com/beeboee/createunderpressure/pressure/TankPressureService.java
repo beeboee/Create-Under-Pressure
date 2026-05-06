@@ -172,7 +172,7 @@ public final class TankPressureService {
         Set<BlockPos> usedTargets = new HashSet<>();
         for (End target : targets) {
             if (!usedTargets.add(target.pipe.relative(target.face))) continue;
-            List<Step> path = path(level, scan, source.pipe, target.pipe);
+            List<Step> path = path(level, scan, source, target.pipe);
             if (path != null) routes.add(new Route(target, path));
         }
         return routes;
@@ -196,12 +196,13 @@ public final class TankPressureService {
         return a.tank != null && b.tank != null && a.tank.getController().equals(b.tank.getController());
     }
 
-    private static List<Step> path(Level level, Scan scan, BlockPos source, BlockPos target) {
+    private static List<Step> path(Level level, Scan scan, End source, BlockPos target) {
+        BlockPos start = source.pipe;
         Map<BlockPos, Step> from = new HashMap<>();
         Set<BlockPos> visited = new HashSet<>();
         ArrayDeque<BlockPos> queue = new ArrayDeque<>();
-        queue.add(source);
-        visited.add(source);
+        queue.add(start);
+        visited.add(start);
 
         while (!queue.isEmpty()) {
             BlockPos pos = queue.removeFirst();
@@ -221,6 +222,7 @@ public final class TankPressureService {
 
                 FluidTankBlockEntity tank = tankAt(level, other);
                 if (tank == null) continue;
+                if (tankBlocksPath(source, tank)) continue;
 
                 for (BlockPos tankSeed : seeds(level, tank)) {
                     if (tankSeed.equals(pos) || !scan.pipes.contains(tankSeed)) continue;
@@ -233,10 +235,10 @@ public final class TankPressureService {
             }
         }
 
-        if (!source.equals(target) && !from.containsKey(target)) return null;
+        if (!start.equals(target) && !from.containsKey(target)) return null;
         List<Step> reversed = new ArrayList<>();
         BlockPos cursor = target;
-        while (!cursor.equals(source)) {
+        while (!cursor.equals(start)) {
             Step step = from.get(cursor);
             if (step == null) return null;
             reversed.add(step);
@@ -245,6 +247,17 @@ public final class TankPressureService {
         List<Step> out = new ArrayList<>();
         for (int i = reversed.size() - 1; i >= 0; i--) out.add(reversed.get(i));
         return out;
+    }
+
+    private static boolean tankBlocksPath(End source, FluidTankBlockEntity tank) {
+        if (source.tank != null && source.tank.getController().equals(tank.getController())) return false;
+        if (tank.getTankInventory().getFluidAmount() >= tank.getTankInventory().getCapacity()) return false;
+        if (tank.surface(tank) >= source.surface - DEAD_HEAD) return false;
+        if (source.tank == null) return true;
+
+        FluidStack sourceFluid = source.tank.getTankInventory().getFluid();
+        FluidStack targetFluid = tank.getTankInventory().getFluid();
+        return targetFluid.isEmpty() || sourceFluid.isEmpty() || FluidStack.isSameFluidSameComponents(sourceFluid, targetFluid);
     }
 
     private static Direction faceToTank(Level level, FluidTankBlockEntity tank, BlockPos pipePos) {
