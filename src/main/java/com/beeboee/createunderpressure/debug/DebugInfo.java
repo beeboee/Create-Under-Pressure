@@ -8,6 +8,8 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
@@ -21,14 +23,22 @@ public final class DebugInfo {
     private DebugInfo() {}
 
     private static final int DEFAULT_SECONDS = 10;
+    private static final int MAX_FILENAME_LABEL_LENGTH = 64;
     private static final DateTimeFormatter FILE_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss");
     private static final DateTimeFormatter LINE_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    private static final Map<UUID, String> lastChatMessages = new HashMap<>();
 
     private static long debugUntilGameTime = -1L;
     private static UUID activePlayerId = null;
     private static ItemStack activeStack = ItemStack.EMPTY;
     private static Path activeLogFile = null;
     private static boolean endedMessageSent = true;
+
+    public static void rememberChat(Player player, String message) {
+        if (player == null || message == null || message.isBlank()) return;
+        lastChatMessages.put(player.getUUID(), message.strip());
+    }
 
     public static void toggle(Level level, Player player, ItemStack stack, boolean stop) {
         if (stop && isEnabled(level)) {
@@ -51,7 +61,7 @@ public final class DebugInfo {
         endedMessageSent = false;
         setGlint(stack, true);
 
-        if (!extending || activeLogFile == null) activeLogFile = newLogFile();
+        if (!extending || activeLogFile == null) activeLogFile = newLogFile(player);
 
         long remainingSeconds = Math.max(0, (debugUntilGameTime - now + 19L) / 20L);
         Component message = Component.literal(extending
@@ -112,14 +122,32 @@ public final class DebugInfo {
         stack.set(DataComponents.ENCHANTMENT_GLINT_OVERRIDE, enabled ? Boolean.TRUE : null);
     }
 
-    private static Path newLogFile() {
+    private static Path newLogFile(Player player) {
         Path dir = Path.of("logs", "create-under-pressure");
         try {
             Files.createDirectories(dir);
         } catch (IOException e) {
             CreateUnderPressure.LOGGER.warn("Could not create Create: Under Pressure debug log directory", e);
         }
-        return dir.resolve("debug-" + LocalDateTime.now().format(FILE_TIME) + ".txt");
+
+        String label = sanitizedLabel(lastChatMessages.get(player.getUUID()));
+        String timestamp = LocalDateTime.now().format(FILE_TIME);
+        return dir.resolve(label + "-" + timestamp + ".txt");
+    }
+
+    private static String sanitizedLabel(String raw) {
+        if (raw == null || raw.isBlank()) return "debug";
+
+        String cleaned = raw.strip()
+            .replaceAll("[\\\\/:*?\"<>|]", "")
+            .replaceAll("[^A-Za-z0-9._ -]", "")
+            .replaceAll("\\s+", "_")
+            .replaceAll("_+", "_");
+
+        cleaned = cleaned.replaceAll("^[._ -]+", "").replaceAll("[._ -]+$", "");
+        if (cleaned.isBlank()) return "debug";
+        if (cleaned.length() > MAX_FILENAME_LABEL_LENGTH) cleaned = cleaned.substring(0, MAX_FILENAME_LABEL_LENGTH);
+        return cleaned;
     }
 
     private static void writeLine(String line) {
