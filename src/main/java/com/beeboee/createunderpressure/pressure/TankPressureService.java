@@ -1,5 +1,6 @@
 package com.beeboee.createunderpressure.pressure;
 
+import com.beeboee.createunderpressure.CreateUnderPressure;
 import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
@@ -20,11 +21,8 @@ import net.minecraft.world.level.block.state.BlockState;
 /**
  * Gives Create fluid tanks passive head pressure.
  *
- * This intentionally mirrors the shape of Create's pump pressure propagation,
- * but keeps our rules in one place:
- *
- * - tanks only pressurize pipe networks below their bottom layer
- * - branches that climb back to the tank-bottom Y value are cut off
+ * - tanks pressurize pipe networks connected at or below their bottom layer
+ * - branches that climb above the tank-bottom Y value are cut off
  * - Create's own pipe flow logic still performs the actual fluid movement
  */
 public final class TankPressureService {
@@ -37,6 +35,7 @@ public final class TankPressureService {
 
     public static void tickTank(FluidTankBlockEntity tank) {
         Level level = tank.getLevel();
+
         if (level == null || level.isClientSide) {
             return;
         }
@@ -48,6 +47,8 @@ public final class TankPressureService {
         if (level.getGameTime() % TICK_INTERVAL != 0) {
             return;
         }
+
+        CreateUnderPressure.LOGGER.info("Tank pressure tick at {}", tank.getBlockPos());
 
         if (tank.getTankInventory().getFluid().isEmpty()) {
             return;
@@ -72,11 +73,20 @@ public final class TankPressureService {
             }
 
             FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, pipePos);
+
+            CreateUnderPressure.LOGGER.info(
+                "Checking side tankBlock={} side={} pipePos={} foundPipe={}",
+                tankBlockPos,
+                side,
+                pipePos,
+                pipe != null
+            );
+
             if (pipe == null) {
                 continue;
             }
 
-            if (pipePos.getY() >= tankBottomY) {
+            if (pipePos.getY() > tankBottomY) {
                 continue;
             }
 
@@ -108,7 +118,7 @@ public final class TankPressureService {
                 continue;
             }
 
-            if (currentPos.getY() >= tankBottomY) {
+            if (currentPos.getY() > tankBottomY) {
                 continue;
             }
 
@@ -130,8 +140,7 @@ public final class TankPressureService {
                     .getSecond()
                     .put(face, true);
 
-                // Do not allow pressure to lift fluid back up to the tank bottom.
-                if (connectedPos.getY() >= tankBottomY) {
+                if (connectedPos.getY() > tankBottomY) {
                     continue;
                 }
 
@@ -160,15 +169,48 @@ public final class TankPressureService {
             }
 
             int head = tankBottomY - pipePos.getY();
-            if (head <= 0) {
+
+            if (head < 0) {
+                CreateUnderPressure.LOGGER.info(
+                    "Skipping pressure above tank bottom pipePos={} tankBottomY={} pipeY={}",
+                    pipePos,
+                    tankBottomY,
+                    pipePos.getY()
+                );
                 continue;
             }
 
-            float pressure = Math.min(MAX_PRESSURE, head * PRESSURE_PER_BLOCK);
+            float pressure = Math.min(MAX_PRESSURE, Math.max(1, head) * PRESSURE_PER_BLOCK);
+
+            CreateUnderPressure.LOGGER.info(
+                "Pressure target pipePos={} head={} pressure={} sides={} hasPressureBefore={}",
+                pipePos,
+                head,
+                pressure,
+                entry.getValue().getSecond().keySet(),
+                pipe.hasAnyPressure()
+            );
 
             for (Direction side : entry.getValue().getSecond().keySet()) {
                 pipe.addPressure(side, true, pressure);
+
+                CreateUnderPressure.LOGGER.info(
+                    "Added tank pressure TRUE pipePos={} side={} pressure={} hasPressureImmediately={} flowAfter={}",
+                    pipePos,
+                    side,
+                    pressure,
+                    pipe.hasAnyPressure(),
+                    pipe.getFlow(side)
+                );
             }
+
+            FluidTransportBehaviour.cacheFlows(level, pipePos);
+
+            CreateUnderPressure.LOGGER.info(
+                "Cached flows pipePos={} hasPressureAfterCache={}",
+                pipePos,
+                pipe.hasAnyPressure()
+            );
         }
     }
 }
