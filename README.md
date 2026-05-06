@@ -1,8 +1,8 @@
 # Create: Under Pressure
 
-A Create addon about making fluids feel heavy.
+A Create addon that adds fluid pressure to Create's existing pipe and fluid systems.
 
-The basic idea is simple: if you build a tank or reservoir above your machinery, that height should matter. Water should be able to push downward through pipes. Lava should churn out slower, stronger power. A machine that is overstressed should stop the flow instead of letting fluid magically pass through anyway.
+The goal is to make height, fluid type, and flow direction matter without replacing Create's pipes. Tanks, reservoirs, outlets, and machines should be able to interact through pressure instead of relying only on pumps.
 
 This is being built for:
 
