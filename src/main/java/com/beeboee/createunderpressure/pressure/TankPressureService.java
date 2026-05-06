@@ -252,7 +252,7 @@ public final class TankPressureService {
     private static boolean tankBlocksPath(End source, FluidTankBlockEntity tank) {
         if (source.tank != null && source.tank.getController().equals(tank.getController())) return false;
         if (tank.getTankInventory().getFluidAmount() >= tank.getTankInventory().getCapacity()) return false;
-        if (tank.surface(tank) >= source.surface - DEAD_HEAD) return false;
+        if (surface(tank) >= source.surface - DEAD_HEAD) return false;
         if (source.tank == null) return true;
 
         FluidStack sourceFluid = source.tank.getTankInventory().getFluid();
