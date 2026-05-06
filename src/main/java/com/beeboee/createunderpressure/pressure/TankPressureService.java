@@ -31,36 +31,41 @@ public final class TankPressureService {
         if (level == null || level.isClientSide || !tank.isController()) return;
         if (level.getGameTime() % TICK_INTERVAL != 0) return;
 
-        Scan scan = scan(level, tank);
-        if (scan == null || scan.pipes.isEmpty()) return;
+        Set<BlockPos> alreadyScanned = new HashSet<>();
+        for (BlockPos seed : seeds(level, tank)) {
+            if (alreadyScanned.contains(seed)) continue;
 
-        End source = bestSource(scan);
-        if (source == null || source.tank == null || !source.tank.getController().equals(tank.getController())) return;
+            Scan scan = scan(level, seed);
+            if (scan == null || scan.pipes.isEmpty()) continue;
+            alreadyScanned.addAll(scan.pipes);
 
-        End target = bestTarget(scan, source);
-        if (target == null) {
+            End source = bestSource(scan);
+            if (source == null || source.tank == null || !source.tank.getController().equals(tank.getController())) continue;
+
+            End target = bestTarget(scan, source);
+            if (target == null) {
+                clearPressure(level, scan);
+                CreateUnderPressure.LOGGER.info("NETWORK idle source={} surface={} endpoints={}", source.name(), source.surface, scan.ends.size());
+                continue;
+            }
+
+            List<Step> path = path(level, scan, source.pipe, target.pipe);
+            if (path == null) {
+                clearPressure(level, scan);
+                CreateUnderPressure.LOGGER.info("NETWORK blocked source={} target={}", source.name(), target.name());
+                continue;
+            }
+
             clearPressure(level, scan);
-            CreateUnderPressure.LOGGER.info("NETWORK idle source={} surface={} endpoints={}", source.name(), source.surface, scan.ends.size());
-            return;
+            apply(level, source, target, path);
         }
-
-        List<Step> path = path(level, scan, source.pipe, target.pipe);
-        if (path == null) {
-            clearPressure(level, scan);
-            CreateUnderPressure.LOGGER.info("NETWORK blocked source={} target={}", source.name(), target.name());
-            return;
-        }
-
-        clearPressure(level, scan);
-        apply(level, source, target, path);
     }
 
-    private static Scan scan(Level level, FluidTankBlockEntity startTank) {
+    private static Scan scan(Level level, BlockPos seed) {
         Set<BlockPos> pipes = new HashSet<>();
         List<End> ends = new ArrayList<>();
         ArrayDeque<Node> queue = new ArrayDeque<>();
-
-        for (BlockPos seed : seeds(level, startTank)) queue.add(new Node(seed, 0));
+        queue.add(new Node(seed, 0));
 
         while (!queue.isEmpty()) {
             Node node = queue.removeFirst();
