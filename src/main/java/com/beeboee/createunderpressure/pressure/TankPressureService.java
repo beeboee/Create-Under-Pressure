@@ -20,9 +20,10 @@ import net.minecraft.world.level.block.state.BlockState;
 public final class TankPressureService {
     private TankPressureService() {}
 
-    private static final int TICK_INTERVAL = 20;
+    private static final int TICK_INTERVAL = 5;
     private static final int MAX_DISTANCE = 96;
-    private static final float PRESSURE_PER_BLOCK = 8.0f;
+    private static final float PRESSURE_PER_BLOCK = 4.0f;
+    private static final float MIN_PRESSURE = 16.0f;
     private static final float MAX_PRESSURE = 256.0f;
     private static final double EPSILON = 0.01;
 
@@ -184,7 +185,7 @@ public final class TankPressureService {
     private static void apply(Level level, End source, End target, List<Step> path) {
         double head = source.surface - target.surface;
         if (head <= EPSILON) return;
-        float pressure = (float) Math.min(MAX_PRESSURE, head * PRESSURE_PER_BLOCK);
+        float pressure = pressureForHead(head);
         Map<BlockPos, Map<Direction, Boolean>> graph = new HashMap<>();
 
         graph.computeIfAbsent(source.pipe, $ -> new IdentityHashMap<>()).put(source.face, true);
@@ -206,6 +207,10 @@ public final class TankPressureService {
         }
 
         for (BlockPos pipePos : graph.keySet()) FluidTransportBehaviour.cacheFlows(level, pipePos);
+    }
+
+    private static float pressureForHead(double head) {
+        return (float) Math.min(MAX_PRESSURE, Math.max(MIN_PRESSURE, head * PRESSURE_PER_BLOCK));
     }
 
     private static FluidTankBlockEntity tankAt(Level level, BlockPos pos) {
