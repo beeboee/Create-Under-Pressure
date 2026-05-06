@@ -1,6 +1,6 @@
 package com.beeboee.createunderpressure.pressure;
 
-import com.beeboee.createunderpressure.CreateUnderPressure;
+import com.beeboee.createunderpressure.debug.DebugInfo;
 import com.simibubi.create.content.fluids.FluidPropagator;
 import com.simibubi.create.content.fluids.FluidTransportBehaviour;
 import com.simibubi.create.content.fluids.tank.FluidTankBlockEntity;
@@ -45,7 +45,7 @@ public final class TankPressureService {
 
             End target = bestTarget(scan, source);
             if (target == null) {
-                CreateUnderPressure.LOGGER.info("NETWORK idle source={} surface={} endpoints={}", source.name(), source.surface, scan.ends.size());
+                DebugInfo.log(level, "NETWORK idle source={} surface={} endpoints={}", source.name(), source.surface, scan.ends.size());
                 continue;
             }
 
@@ -53,7 +53,7 @@ public final class TankPressureService {
 
             List<Step> path = path(level, scan, source.pipe, target.pipe);
             if (path == null) {
-                CreateUnderPressure.LOGGER.info("NETWORK blocked source={} target={}", source.name(), target.name());
+                DebugInfo.log(level, "NETWORK blocked source={} target={}", source.name(), target.name());
                 continue;
             }
 
@@ -192,14 +192,14 @@ public final class TankPressureService {
         }
         graph.computeIfAbsent(target.pipe, $ -> new IdentityHashMap<>()).put(target.face, false);
 
-        CreateUnderPressure.LOGGER.info("NETWORK apply source={} target={} head={} pressure={} path={}", source.name(), target.name(), head, pressure, path.size());
+        DebugInfo.log(level, "NETWORK apply source={} target={} head={} pressure={} path={}", source.name(), target.name(), head, pressure, path.size());
 
         for (Map.Entry<BlockPos, Map<Direction, Boolean>> pipeEntry : graph.entrySet()) {
             FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, pipeEntry.getKey());
             if (pipe == null) continue;
             for (Map.Entry<Direction, Boolean> side : pipeEntry.getValue().entrySet()) {
                 pipe.addPressure(side.getKey(), side.getValue(), pressure);
-                CreateUnderPressure.LOGGER.info("Added tank pressure NETWORK pipePos={} side={} inbound={} pressure={}", pipeEntry.getKey(), side.getKey(), side.getValue(), pressure);
+                DebugInfo.log(level, "Added tank pressure NETWORK pipePos={} side={} inbound={} pressure={}", pipeEntry.getKey(), side.getKey(), side.getValue(), pressure);
             }
         }
 
