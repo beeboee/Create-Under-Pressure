@@ -215,7 +215,6 @@ public final class TankPressureService {
         double head = source.surface - target.surface;
         if (head <= EPSILON) return;
         float pressure = pressureForHead(head) * share;
-        if (pressure < MIN_PRESSURE && share >= 1.0f) pressure = MIN_PRESSURE;
         Map<BlockPos, Map<Direction, Boolean>> graph = new HashMap<>();
 
         graph.computeIfAbsent(source.pipe, $ -> new IdentityHashMap<>()).put(source.face, true);
@@ -240,7 +239,9 @@ public final class TankPressureService {
     }
 
     private static float pressureForHead(double head) {
-        return (float) Math.min(MAX_PRESSURE, Math.max(MIN_PRESSURE, head * PRESSURE_PER_BLOCK));
+        float pressure = (float) Math.min(MAX_PRESSURE, head * PRESSURE_PER_BLOCK);
+        if (head >= 1.0) return Math.max(MIN_PRESSURE, pressure);
+        return pressure;
     }
 
     private static FluidTankBlockEntity tankAt(Level level, BlockPos pos) {
@@ -251,9 +252,14 @@ public final class TankPressureService {
 
     private static double surface(FluidTankBlockEntity tank) {
         int amount = tank.getTankInventory().getFluidAmount();
+        if (amount <= 0) return tank.getController().getY();
+        return tank.getController().getY() + (amount / layerCapacity(tank));
+    }
+
+    private static double layerCapacity(FluidTankBlockEntity tank) {
         int capacity = tank.getTankInventory().getCapacity();
-        if (amount <= 0 || capacity <= 0) return tank.getController().getY();
-        return tank.getController().getY() + (Math.min(1.0, (double) amount / (double) capacity) * tank.getHeight());
+        int height = Math.max(1, tank.getHeight());
+        return (double) capacity / (double) height;
     }
 
     private record Scan(Set<BlockPos> pipes, List<End> ends) {}
