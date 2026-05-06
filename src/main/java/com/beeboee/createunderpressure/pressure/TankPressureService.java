@@ -94,7 +94,12 @@ public final class TankPressureService {
                 if (tank != null) {
                     ends.add(End.tank(node.pos, face, tank));
                     if (bridgedTanks.add(tank.getController())) {
-                        for (BlockPos tankSeed : seeds(level, tank)) queue.add(new Node(tankSeed, node.distance + 1));
+                        for (BlockPos tankSeed : seeds(level, tank)) {
+                            Direction targetFace = faceToTank(level, tank, tankSeed);
+                            if (targetFace != null && tankCanProvideToPipe(tankSeed, targetFace, tank)) {
+                                queue.add(new Node(tankSeed, node.distance + 1));
+                            }
+                        }
                     }
                     continue;
                 }
@@ -218,9 +223,10 @@ public final class TankPressureService {
                 if (tank == null) continue;
 
                 for (BlockPos tankSeed : seeds(level, tank)) {
-                    if (tankSeed.equals(pos) || !scan.pipes.contains(tankSeed) || !visited.add(tankSeed)) continue;
+                    if (tankSeed.equals(pos) || !scan.pipes.contains(tankSeed)) continue;
                     Direction targetFace = faceToTank(level, tank, tankSeed);
-                    if (targetFace == null) continue;
+                    if (targetFace == null || !tankCanProvideToPipe(tankSeed, targetFace, tank)) continue;
+                    if (!visited.add(tankSeed)) continue;
                     from.put(tankSeed, new Step(pos, face, tankSeed, targetFace));
                     queue.add(tankSeed);
                 }
