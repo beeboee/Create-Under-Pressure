@@ -23,9 +23,11 @@ public final class TankPressureService {
 
     private static final int TICK_INTERVAL = 5;
     private static final int MAX_DISTANCE = 96;
+    private static final float TRICKLE_PRESSURE = 4.0f;
     private static final float MIN_PRESSURE = 16.0f;
     private static final float MAX_PRESSURE = 256.0f;
-    private static final double MIN_HEAD = 0.5;
+    private static final double DEAD_HEAD = 0.125;
+    private static final double TRICKLE_HEAD = 1.0;
     private static final double MAX_HEAD = 32.0;
     private static final double EPSILON = 0.01;
 
@@ -135,7 +137,7 @@ public final class TankPressureService {
         for (End end : scan.ends) {
             if (!end.receives) continue;
             if (sameTank(source, end)) continue;
-            if (end.surface >= source.surface - MIN_HEAD) continue;
+            if (end.surface >= source.surface - DEAD_HEAD) continue;
             targets.add(end);
         }
         targets.sort(Comparator.comparingDouble((End end) -> end.surface).thenComparingInt(end -> end.pipe.getY()));
@@ -240,9 +242,13 @@ public final class TankPressureService {
     }
 
     private static float pressureForHead(double head) {
-        if (head < MIN_HEAD) return 0.0f;
-        double t = Math.min(1.0, (head - MIN_HEAD) / (MAX_HEAD - MIN_HEAD));
-        return (float) (MIN_PRESSURE + (t * (MAX_PRESSURE - MIN_PRESSURE)));
+        if (head < DEAD_HEAD) return 0.0f;
+        if (head < TRICKLE_HEAD) {
+            double t = (head - DEAD_HEAD) / (TRICKLE_HEAD - DEAD_HEAD);
+            return (float) (TRICKLE_PRESSURE * t * t);
+        }
+        double t = Math.min(1.0, (head - TRICKLE_HEAD) / (MAX_HEAD - TRICKLE_HEAD));
+        return (float) (MIN_PRESSURE + (t * t * (MAX_PRESSURE - MIN_PRESSURE)));
     }
 
     private static FluidTankBlockEntity tankAt(Level level, BlockPos pos) {
