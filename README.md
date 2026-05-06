@@ -1,5 +1,7 @@
 # Create: Under Pressure
 
+Current dev version: `0.1.1`
+
 A Create addon that adds fluid pressure to Create's existing pipe and fluid systems.
 
 The goal is to make height, fluid type, and flow direction matter without replacing Create's pipes. Tanks, reservoirs, outlets, and machines should be able to interact through pressure instead of relying only on pumps.
@@ -10,6 +12,24 @@ This is being built for:
 - NeoForge `21.1.227`
 - Create `6.0.10`
 - Java `21`
+
+## Version notes
+
+### `0.1.1`
+
+Development/debug cleanup baseline:
+
+- Added improved debug-stick logging sessions.
+- Debug logs now write to `run/logs/create-under-pressure/`.
+- Right-clicking the debug stick extends logging by 10 seconds.
+- Shift-right-clicking the debug stick stops logging.
+- Debug stick gets temporary enchantment glint while logging.
+- Removed the direct tank-equalizer experiment that caused bucket-sized transfers.
+- Kept pressure-service cleanup, tank surface math improvements, and fluid compatibility checks.
+
+### `0.1.0`
+
+Initial scaffold and early pressure experiments.
 
 ## Planned features
 
@@ -85,4 +105,4 @@ Mixins will probably be needed, but they should be small and focused. The mod sh
 
 ## Status
 
-Early planning/scaffold stage. Nothing playable yet.
+Early development. Pressure experiments are playable in dev, but behavior is still being refined.
