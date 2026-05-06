@@ -6,6 +6,7 @@ import com.simibubi.create.content.fluids.FluidTransportBehaviour;
 import com.simibubi.create.content.fluids.tank.FluidTankBlockEntity;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
@@ -43,21 +44,23 @@ public final class TankPressureService {
             End source = bestSource(scan);
             if (source == null) continue;
 
-            End target = bestTarget(scan, source);
-            if (target == null) {
+            List<End> targets = targets(scan, source);
+            if (targets.isEmpty()) {
                 DebugInfo.log(level, "NETWORK idle source={} surface={} endpoints={}", source.name(), source.surface, scan.ends.size());
                 continue;
             }
 
-            if (!belongsToTank(source, tank) && !belongsToTank(target, tank)) continue;
+            if (!belongsToTank(source, tank) && targets.stream().noneMatch(target -> belongsToTank(target, tank))) continue;
 
-            List<Step> path = path(level, scan, source.pipe, target.pipe);
-            if (path == null) {
-                DebugInfo.log(level, "NETWORK blocked source={} target={}", source.name(), target.name());
+            List<Route> routes = routes(level, scan, source, targets);
+            if (routes.isEmpty()) {
+                DebugInfo.log(level, "NETWORK blocked source={} targets={}", source.name(), targets.size());
                 continue;
             }
 
-            apply(level, source, target, path);
+            float share = 1.0f / routes.size();
+            DebugInfo.log(level, "NETWORK split source={} targets={} share={}", source.name(), routes.size(), share);
+            for (Route route : routes) apply(level, source, route.target, route.path, share);
         }
     }
 
@@ -126,15 +129,27 @@ public final class TankPressureService {
         return best;
     }
 
-    private static End bestTarget(Scan scan, End source) {
-        End best = null;
+    private static List<End> targets(Scan scan, End source) {
+        List<End> targets = new ArrayList<>();
         for (End end : scan.ends) {
             if (!end.receives) continue;
             if (sameTank(source, end)) continue;
             if (end.surface >= source.surface - EPSILON) continue;
-            if (best == null || end.surface < best.surface - EPSILON || (Math.abs(end.surface - best.surface) <= EPSILON && end.pipe.getY() < best.pipe.getY())) best = end;
+            targets.add(end);
         }
-        return best;
+        targets.sort(Comparator.comparingDouble((End end) -> end.surface).thenComparingInt(end -> end.pipe.getY()));
+        return targets;
+    }
+
+    private static List<Route> routes(Level level, Scan scan, End source, List<End> targets) {
+        List<Route> routes = new ArrayList<>();
+        Set<BlockPos> usedTargets = new HashSet<>();
+        for (End target : targets) {
+            if (!usedTargets.add(target.pipe.relative(target.face))) continue;
+            List<Step> path = path(level, scan, source.pipe, target.pipe);
+            if (path != null) routes.add(new Route(target, path));
+        }
+        return routes;
     }
 
     private static boolean sameTank(End a, End b) {
@@ -179,10 +194,11 @@ public final class TankPressureService {
         return out;
     }
 
-    private static void apply(Level level, End source, End target, List<Step> path) {
+    private static void apply(Level level, End source, End target, List<Step> path, float share) {
         double head = source.surface - target.surface;
         if (head <= EPSILON) return;
-        float pressure = pressureForHead(head);
+        float pressure = pressureForHead(head) * share;
+        if (pressure < MIN_PRESSURE && share >= 1.0f) pressure = MIN_PRESSURE;
         Map<BlockPos, Map<Direction, Boolean>> graph = new HashMap<>();
 
         graph.computeIfAbsent(source.pipe, $ -> new IdentityHashMap<>()).put(source.face, true);
@@ -192,7 +208,7 @@ public final class TankPressureService {
         }
         graph.computeIfAbsent(target.pipe, $ -> new IdentityHashMap<>()).put(target.face, false);
 
-        DebugInfo.log(level, "NETWORK apply source={} target={} head={} pressure={} path={}", source.name(), target.name(), head, pressure, path.size());
+        DebugInfo.log(level, "NETWORK apply source={} target={} head={} pressure={} share={} path={}", source.name(), target.name(), head, pressure, share, path.size());
 
         for (Map.Entry<BlockPos, Map<Direction, Boolean>> pipeEntry : graph.entrySet()) {
             FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, pipeEntry.getKey());
@@ -226,6 +242,7 @@ public final class TankPressureService {
     private record Scan(Set<BlockPos> pipes, List<End> ends) {}
     private record Node(BlockPos pos, int distance) {}
     private record Step(BlockPos from, Direction face, BlockPos to) {}
+    private record Route(End target, List<Step> path) {}
 
     private static final class End {
         final BlockPos pipe;
