@@ -12,6 +12,8 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
@@ -26,6 +28,8 @@ public final class DebugInfo {
 
     private static final int DEFAULT_SECONDS = 10;
     private static final int MAX_FILENAME_LABEL_LENGTH = 64;
+    private static final int LOOSE_TARGET_RADIUS = 8;
+    private static final Pattern BLOCK_POS_PATTERN = Pattern.compile("BlockPos\\{x=(-?\\d+), y=(-?\\d+), z=(-?\\d+)\\}");
     private static final DateTimeFormatter FILE_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss");
     private static final DateTimeFormatter LINE_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
@@ -80,7 +84,7 @@ public final class DebugInfo {
         if (!extending || activeLogFile == null) activeLogFile = newLogFile(player);
 
         long remainingSeconds = Math.max(0, (debugUntilGameTime - now + 19L) / 20L);
-        String scope = selectedTarget == null ? "global" : "network containing " + selectedTarget.toShortString();
+        String scope = selectedTarget == null ? "global" : "network near " + selectedTarget.toShortString();
         Component message = Component.literal(extending
             ? "Create: Under Pressure debug logging extended by " + seconds + " seconds (" + remainingSeconds + "s remaining, " + scope + ")"
             : "Create: Under Pressure debug logging enabled for " + seconds + " seconds (" + scope + ")");
@@ -142,7 +146,11 @@ public final class DebugInfo {
     }
 
     private static boolean touchesSelectedTarget(Set<BlockPos> networkPipes) {
-        return selectedTarget == null || networkPipes.contains(selectedTarget);
+        if (selectedTarget == null) return true;
+        for (BlockPos pipe : networkPipes) {
+            if (pipe.distManhattan(selectedTarget) <= 1) return true;
+        }
+        return false;
     }
 
     private static boolean passesLooseTargetFilter(String line) {
@@ -150,7 +158,18 @@ public final class DebugInfo {
 
         String shortPos = selectedTarget.toShortString();
         String longPos = selectedTarget.toString();
-        return line.contains(shortPos) || line.contains(longPos);
+        if (line.contains(shortPos) || line.contains(longPos)) return true;
+
+        Matcher matcher = BLOCK_POS_PATTERN.matcher(line);
+        while (matcher.find()) {
+            int x = Integer.parseInt(matcher.group(1));
+            int y = Integer.parseInt(matcher.group(2));
+            int z = Integer.parseInt(matcher.group(3));
+            int distance = Math.abs(x - selectedTarget.getX()) + Math.abs(y - selectedTarget.getY()) + Math.abs(z - selectedTarget.getZ());
+            if (distance <= LOOSE_TARGET_RADIUS) return true;
+        }
+
+        return false;
     }
 
     private static void clearNetworkContext() {
