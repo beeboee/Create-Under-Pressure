@@ -34,6 +34,7 @@ public final class TankPressureService {
     private static final int MAX_WORLD_FILL_MB = 250;
     private static final int WORLD_BLOCK_MB = 1000;
     private static final int SETTLE_EPSILON_MB = 25;
+    private static final int MAX_WORLD_SOURCE_SEARCH = 96;
     private static final double HYDRAULIC_SETTLE_DEADBAND = 0.05;
     private static final double HYDRAULIC_SETTLE_FULL_HEAD = 1.0;
 
@@ -53,6 +54,7 @@ public final class TankPressureService {
     private static final double EPSILON = 0.01;
 
     private static final Map<Level, ProcessedTick> PROCESSED = new WeakHashMap<>();
+    private static final Map<Level, Map<BlockPos, Integer>> WORLD_SOURCE_DRAWS = new WeakHashMap<>();
 
     public static void tickTank(FluidTankBlockEntity tank) {
         // Intentionally disabled. Tank movement should come from connected pipe pressure,
@@ -283,8 +285,15 @@ public final class TankPressureService {
             if (!level.isLoaded(worldPos)) continue;
 
             FluidState fluidState = level.getFluidState(worldPos);
-            if (fluidState.isSource()) {
-                moved += fillTanksFromWorldSource(level, scan, contacts, end, worldPos, fluidState, MAX_WORLD_FILL_MB - moved);
+            if (!fluidState.isEmpty()) {
+                WorldIntake intake = resolveWorldIntake(level, worldPos, fluidState);
+                if (intake != null) {
+                    int filled = fillTanksFromWorldSource(level, scan, contacts, end, intake, MAX_WORLD_FILL_MB - moved);
+                    moved += filled;
+                    if (filled > 0) recordWorldSourceDraw(level, intake, filled);
+                } else {
+                    DebugInfo.log(level, "WORLD intake skip end={} pos={} reason=noSourceFound touchedFluid={}", end.name(), worldPos, fluidState.getType());
+                }
             } else if (level.getBlockState(worldPos).isAir()) {
                 moved += drainTanksToWorld(level, scan, contacts, end, worldPos, MAX_WORLD_FILL_MB - moved);
             } else {
@@ -296,10 +305,67 @@ public final class TankPressureService {
         return moved;
     }
 
-    private static int fillTanksFromWorldSource(Level level, Scan scan, List<TankContact> contacts, End source, BlockPos sourcePos, FluidState fluidState, int budget) {
+    private static WorldIntake resolveWorldIntake(Level level, BlockPos touchedPos, FluidState touchedState) {
+        if (touchedState.isEmpty()) return null;
+        Fluid touchedFluid = touchedState.getType();
+        if (touchedState.isSource()) {
+            Fluid sourceFluid = sourceFluidFor(touchedFluid);
+            DebugInfo.log(level, "WORLD intake sourceResolved touched={} source={} distance=0 fluid={} touchedSource=true", touchedPos, touchedPos, sourceFluid);
+            return new WorldIntake(touchedPos, touchedPos, sourceFluid, 0, true);
+        }
+
+        Set<BlockPos> visited = new HashSet<>();
+        ArrayDeque<Node> queue = new ArrayDeque<>();
+        queue.add(new Node(touchedPos, 0));
+        visited.add(touchedPos);
+
+        while (!queue.isEmpty()) {
+            Node node = queue.removeFirst();
+            if (node.distance > MAX_WORLD_SOURCE_SEARCH) continue;
+
+            FluidState state = level.getFluidState(node.pos);
+            if (!sameFluidKind(touchedFluid, state.getType())) continue;
+            if (state.isSource()) {
+                Fluid sourceFluid = sourceFluidFor(state.getType());
+                DebugInfo.log(level, "WORLD intake sourceResolved touched={} source={} distance={} fluid={} touchedSource=false", touchedPos, node.pos, node.distance, sourceFluid);
+                return new WorldIntake(touchedPos, node.pos, sourceFluid, node.distance, false);
+            }
+
+            for (Direction direction : Direction.values()) {
+                BlockPos next = node.pos.relative(direction);
+                if (!level.isLoaded(next) || !visited.add(next)) continue;
+                FluidState nextState = level.getFluidState(next);
+                if (!nextState.isEmpty() && sameFluidKind(touchedFluid, nextState.getType())) {
+                    queue.add(new Node(next, node.distance + 1));
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static void recordWorldSourceDraw(Level level, WorldIntake intake, int amount) {
+        Map<BlockPos, Integer> draws = WORLD_SOURCE_DRAWS.computeIfAbsent(level, $ -> new HashMap<>());
+        int total = draws.getOrDefault(intake.sourcePos, 0) + amount;
+        if (total < WORLD_BLOCK_MB) {
+            draws.put(intake.sourcePos, total);
+            return;
+        }
+
+        draws.remove(intake.sourcePos);
+        FluidState current = level.getFluidState(intake.sourcePos);
+        if (!current.isEmpty() && current.isSource() && sameFluidKind(current.getType(), intake.fluid)) {
+            level.setBlockAndUpdate(intake.sourcePos, Blocks.AIR.defaultBlockState());
+            DebugInfo.log(level, "WORLD intake consumedSource source={} fluid={} pulled={} touched={} distance={}", intake.sourcePos, intake.fluid, total, intake.touchedPos, intake.distance);
+        } else {
+            DebugInfo.log(level, "WORLD intake sourceGone source={} fluid={} pulled={} touched={} distance={}", intake.sourcePos, intake.fluid, total, intake.touchedPos, intake.distance);
+        }
+    }
+
+    private static int fillTanksFromWorldSource(Level level, Scan scan, List<TankContact> contacts, End source, WorldIntake intake, int budget) {
         if (budget <= 0) return 0;
-        Fluid fluid = fluidState.getType();
-        double sourceHead = source.head;
+        Fluid fluid = intake.fluid;
+        double sourceHead = intake.sourcePos.getY() + 1.0;
         List<TankContact> targets = reachableContactsFrom(level, scan, contacts, source.pipe, sourceHead);
         int moved = 0;
 
@@ -329,11 +395,11 @@ public final class TankPressureService {
             if (filled <= 0) continue;
 
             moved += filled;
-            DebugInfo.log(level, "WORLD fill source={} sourcePos={} target={} targetPipe={} moved={} requested={} sourceHead={} targetSurface={} cutoff={} fluid={}",
-                    source.name(), sourcePos, target.tank.getController(), target.pipe, filled, request, sourceHead, surface(target.tank), target.cutoffSurface(), fluid);
+            DebugInfo.log(level, "WORLD fill source={} touchedPos={} sourcePos={} target={} targetPipe={} moved={} requested={} sourceHead={} targetSurface={} cutoff={} fluid={} sourceDistance={}",
+                    source.name(), intake.touchedPos, intake.sourcePos, target.tank.getController(), target.pipe, filled, request, sourceHead, surface(target.tank), target.cutoffSurface(), fluid, intake.distance);
         }
 
-        if (moved <= 0) DebugInfo.log(level, "WORLD fill idle source={} sourcePos={} sourceHead={} fluid={}", source.name(), sourcePos, sourceHead, fluid);
+        if (moved <= 0) DebugInfo.log(level, "WORLD fill idle source={} touchedPos={} sourcePos={} sourceHead={} fluid={} sourceDistance={}", source.name(), intake.touchedPos, intake.sourcePos, sourceHead, fluid, intake.distance);
         return moved;
     }
 
@@ -439,6 +505,24 @@ public final class TankPressureService {
     private static boolean canFillWith(FluidTankBlockEntity tank, Fluid fluid) {
         FluidStack existing = tank.getTankInventory().getFluid();
         return existing.isEmpty() || FluidStack.isSameFluidSameComponents(existing, new FluidStack(fluid, 1));
+    }
+
+    private static boolean sameFluidKind(Fluid a, Fluid b) {
+        return (isWater(a) && isWater(b)) || (isLavaFluid(a) && isLavaFluid(b));
+    }
+
+    private static Fluid sourceFluidFor(Fluid fluid) {
+        if (isWater(fluid)) return Fluids.WATER;
+        if (isLavaFluid(fluid)) return Fluids.LAVA;
+        return fluid;
+    }
+
+    private static boolean isWater(Fluid fluid) {
+        return fluid == Fluids.WATER || fluid == Fluids.FLOWING_WATER;
+    }
+
+    private static boolean isLavaFluid(Fluid fluid) {
+        return fluid == Fluids.LAVA || fluid == Fluids.FLOWING_LAVA;
     }
 
     private static boolean canPlaceFluidBlock(Fluid fluid) {
@@ -984,6 +1068,7 @@ public final class TankPressureService {
             return new TankContact(tank, pipe, face, distance);
         }
     }
+    private record WorldIntake(BlockPos touchedPos, BlockPos sourcePos, Fluid fluid, int distance, boolean touchedSource) {}
     private record HydraulicMovePlan(TankContact source, TankContact target, int amount, double sourceSurface, double sharedSurface) {}
     private record PressureRoute(End source, End target, List<Step> path, double head, double activeHead, double conductance, float pressure) {}
     private record ProcessedTick(long gameTime, Set<BlockPos> pipes) {}
