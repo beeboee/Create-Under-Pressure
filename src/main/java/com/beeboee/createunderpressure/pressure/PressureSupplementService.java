@@ -27,7 +27,7 @@ import net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction;
 /**
  * Small, conservative sim-side corrections layered on top of TankPressureService.
  *
- * This exists so we can spot-fix the current test failures without making the main
+ * This exists so we can spot-fix current test failures without making the main
  * pressure service even more tangled. It can be folded back into TankPressureService
  * once the behavior is proven.
  */
@@ -40,6 +40,7 @@ public final class PressureSupplementService {
     private static final int MAX_TANK_SETTLE_MB = 125;
     private static final int WORLD_BLOCK_MB = 1000;
     private static final int MAX_OUTLET_SEARCH = 16;
+    private static final int MAX_SAME_BODY_SEARCH = 192;
     private static final int MOVED_SOURCE_SUPPRESSION_TICKS = 60;
     private static final double EPSILON = 0.01;
     private static final double DEAD_BAND = 0.05;
@@ -50,6 +51,19 @@ public final class PressureSupplementService {
 
     private static final Map<Level, ProcessedTick> PROCESSED = new WeakHashMap<>();
     private static final Map<Level, Map<BlockPos, Long>> RECENTLY_MOVED_SOURCES = new WeakHashMap<>();
+
+    /**
+     * The main pressure service still has older world->world behavior that can move
+     * sources upward or bounce them through the same pool. For pure world-only pipe
+     * networks, this layer owns that behavior so the stricter source-movement rules
+     * are the only ones applied.
+     */
+    public static boolean shouldOwnWorldOnlyNetwork(FluidTransportBehaviour pipe) {
+        Level level = pipe.getWorld();
+        if (level == null || level.isClientSide) return false;
+        Scan scan = scan(level, pipe.getPos());
+        return !scan.pipes.isEmpty() && scan.contacts.isEmpty() && scan.openEnds.size() >= 2;
+    }
 
     public static void tickPipe(FluidTransportBehaviour pipe) {
         Level level = pipe.getWorld();
@@ -120,7 +134,6 @@ public final class PressureSupplementService {
                     TankContact contact = new TankContact(tank, node.pos, face);
                     contacts.add(contact);
 
-                    // Include other pipe contacts on the same tank when the tank can bridge to them.
                     if (canProvide(contact)) {
                         for (BlockPos tankSeed : tankSeeds(level, tank)) {
                             if (!tankSeed.equals(node.pos)) queue.add(new Node(tankSeed, node.distance + 1));
@@ -202,7 +215,12 @@ public final class PressureSupplementService {
                     continue;
                 }
 
-                BlockPos placePos = outletPlacement(level, targetEnd.worldPos(), fluid, maxOutputY);
+                if (sameFluidBody(level, sourcePos, targetEnd.worldPos(), fluid)) {
+                    DebugInfo.log(level, "SUPPLEMENT world transfer skip source={} outlet={} reason=sameBody", sourcePos, targetEnd.worldPos());
+                    continue;
+                }
+
+                BlockPos placePos = outletPlacement(level, targetEnd.worldPos(), fluid, maxOutputY, sourcePos);
                 if (placePos == null) continue;
                 targets.add(new WorldOutletTarget(targetEnd, placePos, targetEnd.worldPos().distManhattan(placePos)));
             }
@@ -224,7 +242,7 @@ public final class PressureSupplementService {
                 return WORLD_BLOCK_MB;
             }
 
-            DebugInfo.log(level, "SUPPLEMENT world transfer idle source={} reason=noDownwardFlowingOutlet", sourcePos);
+            DebugInfo.log(level, "SUPPLEMENT world transfer idle source={} reason=noSeparateDownwardFlowingOutlet", sourcePos);
         }
 
         return 0;
@@ -249,8 +267,6 @@ public final class PressureSupplementService {
     private static void hardDeleteWorldSource(Level level, BlockPos sourcePos, Fluid fluid) {
         level.setBlockAndUpdate(sourcePos, Blocks.AIR.defaultBlockState());
 
-        // Vanilla water can immediately remake an infinite source. Remove one adjacent
-        // matching source block as a breaker so a moved source actually leaves the inlet.
         for (Direction direction : SOURCE_BREAK_DIRECTIONS) {
             BlockPos breaker = sourcePos.relative(direction);
             if (!level.isLoaded(breaker)) continue;
@@ -264,9 +280,10 @@ public final class PressureSupplementService {
         }
     }
 
-    private static BlockPos outletPlacement(Level level, BlockPos targetPos, Fluid fluid, int maxOutputY) {
+    private static BlockPos outletPlacement(Level level, BlockPos targetPos, Fluid fluid, int maxOutputY, BlockPos sourcePos) {
         if (!level.isLoaded(targetPos)) return null;
-        if (canPlaceFlowingBlockAtOutlet(level, targetPos, fluid, maxOutputY)) return targetPos;
+        if (canPlaceFlowingBlockAtOutlet(level, targetPos, fluid, maxOutputY)
+                && !sameFluidBody(level, sourcePos, targetPos, fluid)) return targetPos;
 
         Set<BlockPos> visited = new HashSet<>();
         ArrayDeque<Node> queue = new ArrayDeque<>();
@@ -277,7 +294,8 @@ public final class PressureSupplementService {
             Node node = queue.removeFirst();
             if (node.distance > MAX_OUTLET_SEARCH) continue;
 
-            if (canPlaceFlowingBlockAtOutlet(level, node.pos, fluid, maxOutputY)) return node.pos;
+            if (canPlaceFlowingBlockAtOutlet(level, node.pos, fluid, maxOutputY)
+                    && !sameFluidBody(level, sourcePos, node.pos, fluid)) return node.pos;
 
             for (Direction direction : Direction.values()) {
                 BlockPos next = node.pos.relative(direction);
@@ -290,6 +308,37 @@ public final class PressureSupplementService {
         }
 
         return null;
+    }
+
+    private static boolean sameFluidBody(Level level, BlockPos a, BlockPos b, Fluid fluid) {
+        if (a.equals(b)) return true;
+        if (!level.isLoaded(a) || !level.isLoaded(b)) return false;
+        FluidState aState = level.getFluidState(a);
+        FluidState bState = level.getFluidState(b);
+        if (aState.isEmpty() || bState.isEmpty()) return false;
+        if (!sameFluidKind(aState.getType(), fluid) || !sameFluidKind(bState.getType(), fluid)) return false;
+
+        Set<BlockPos> visited = new HashSet<>();
+        ArrayDeque<Node> queue = new ArrayDeque<>();
+        queue.add(new Node(a, 0));
+        visited.add(a);
+
+        while (!queue.isEmpty()) {
+            Node node = queue.removeFirst();
+            if (node.distance > MAX_SAME_BODY_SEARCH) continue;
+            if (node.pos.equals(b)) return true;
+
+            for (Direction direction : Direction.values()) {
+                BlockPos next = node.pos.relative(direction);
+                if (!level.isLoaded(next) || !visited.add(next)) continue;
+                FluidState state = level.getFluidState(next);
+                if (!state.isEmpty() && sameFluidKind(state.getType(), fluid)) {
+                    queue.add(new Node(next, node.distance + 1));
+                }
+            }
+        }
+
+        return false;
     }
 
     private static boolean canPlaceFlowingBlockAtOutlet(Level level, BlockPos pos, Fluid fluid, int maxOutputY) {
