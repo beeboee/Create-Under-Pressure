@@ -154,11 +154,7 @@ public final class WorldExchangeVisualLayer {
     private record Node(BlockPos pos, int distance) {}
     private record OpenEnd(BlockPos pipe, Direction face) {}
     private record VisualScan(Set<BlockPos> pipes, Set<OpenEnd> openEnds, boolean hasFluidSupply, int supplyScore) {
-        boolean hasFluidSupply() {
-            return hasFluidSupply;
-        }
-
-        double strength() {
+        public double strength() {
             return Math.max(0.15, Math.min(1.0, supplyScore / 1000.0));
         }
     }
