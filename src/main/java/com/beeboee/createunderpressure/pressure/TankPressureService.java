@@ -312,6 +312,10 @@ public final class TankPressureService {
                 if (source == target) continue;
                 if (!canReceiveFrom(source, target)) continue;
                 if (tankToTank(source, target)) continue;
+                if (source.tank != null && target.openEnd) {
+                    DebugInfo.log(level, "GRAPH skip raw tank drain source={} target={}", source.name(), target.name());
+                    continue;
+                }
 
                 double head = source.head - target.head;
                 double requiredHead = requiredHead(source, target);
