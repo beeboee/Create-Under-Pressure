@@ -222,11 +222,12 @@ public final class PressureSupplementService {
 
                 BlockPos placePos = outletPlacement(level, targetEnd.worldPos(), fluid, maxOutputY, sourcePos);
                 if (placePos == null) continue;
-                targets.add(new WorldOutletTarget(targetEnd, placePos, targetEnd.worldPos().distManhattan(placePos)));
+                targets.add(new WorldOutletTarget(targetEnd, placePos, targetEnd.worldPos().distManhattan(placePos), isFlowingFluid(level, placePos, fluid)));
             }
 
             targets.sort(Comparator
-                    .comparingInt((WorldOutletTarget target) -> target.placePos.getY())
+                    .comparing((WorldOutletTarget target) -> !target.flowing)
+                    .thenComparingInt(target -> target.placePos.getY())
                     .thenComparingInt(target -> target.searchDistance)
                     .thenComparing(target -> target.placePos, PressureSupplementService::compareBlockPos));
 
@@ -237,12 +238,12 @@ public final class PressureSupplementService {
                 markRecentlyMovedSource(level, sourcePos);
                 markRecentlyMovedSource(level, target.placePos);
                 DebugInfo.log(level,
-                        "SUPPLEMENT world transfer source={} target={} outlet={} fluid={} sourceHead={} searchDistance={} rule=downFirstFlowingOnly",
-                        sourcePos, target.placePos, target.end.worldPos(), fluid, sourceHead, target.searchDistance);
+                        "SUPPLEMENT world transfer source={} target={} outlet={} fluid={} sourceHead={} searchDistance={} flowingTarget={} rule=flowingFirstDownNoSameBody",
+                        sourcePos, target.placePos, target.end.worldPos(), fluid, sourceHead, target.searchDistance, target.flowing);
                 return WORLD_BLOCK_MB;
             }
 
-            DebugInfo.log(level, "SUPPLEMENT world transfer idle source={} reason=noSeparateDownwardFlowingOutlet", sourcePos);
+            DebugInfo.log(level, "SUPPLEMENT world transfer idle source={} reason=noSeparateDownwardOutlet", sourcePos);
         }
 
         return 0;
@@ -282,13 +283,15 @@ public final class PressureSupplementService {
 
     private static BlockPos outletPlacement(Level level, BlockPos targetPos, Fluid fluid, int maxOutputY, BlockPos sourcePos) {
         if (!level.isLoaded(targetPos)) return null;
-        if (canPlaceFlowingBlockAtOutlet(level, targetPos, fluid, maxOutputY)
+        if (canPlaceAtOutlet(level, targetPos, fluid, maxOutputY)
                 && !sameFluidBody(level, sourcePos, targetPos, fluid)) return targetPos;
 
         Set<BlockPos> visited = new HashSet<>();
         ArrayDeque<Node> queue = new ArrayDeque<>();
         queue.add(new Node(targetPos, 0));
         visited.add(targetPos);
+        BlockPos bestAir = null;
+        int bestAirDistance = Integer.MAX_VALUE;
 
         while (!queue.isEmpty()) {
             Node node = queue.removeFirst();
@@ -297,17 +300,26 @@ public final class PressureSupplementService {
             if (canPlaceFlowingBlockAtOutlet(level, node.pos, fluid, maxOutputY)
                     && !sameFluidBody(level, sourcePos, node.pos, fluid)) return node.pos;
 
+            if (canPlaceAirBlockAtOutlet(level, node.pos, maxOutputY) && node.distance < bestAirDistance) {
+                bestAir = node.pos;
+                bestAirDistance = node.distance;
+            }
+
             for (Direction direction : Direction.values()) {
                 BlockPos next = node.pos.relative(direction);
                 if (!level.isLoaded(next) || !visited.add(next)) continue;
+                if (next.getY() > maxOutputY) continue;
+
                 FluidState nextState = level.getFluidState(next);
-                if (!nextState.isEmpty() && sameFluidKind(nextState.getType(), fluid) && next.getY() <= maxOutputY) {
+                if (!nextState.isEmpty() && sameFluidKind(nextState.getType(), fluid)) {
+                    queue.add(new Node(next, node.distance + 1));
+                } else if (level.getBlockState(next).isAir()) {
                     queue.add(new Node(next, node.distance + 1));
                 }
             }
         }
 
-        return null;
+        return bestAir;
     }
 
     private static boolean sameFluidBody(Level level, BlockPos a, BlockPos b, Fluid fluid) {
@@ -341,15 +353,27 @@ public final class PressureSupplementService {
         return false;
     }
 
+    private static boolean canPlaceAtOutlet(Level level, BlockPos pos, Fluid fluid, int maxOutputY) {
+        return canPlaceFlowingBlockAtOutlet(level, pos, fluid, maxOutputY) || canPlaceAirBlockAtOutlet(level, pos, maxOutputY);
+    }
+
     private static boolean canPlaceFlowingBlockAtOutlet(Level level, BlockPos pos, Fluid fluid, int maxOutputY) {
         if (pos.getY() > maxOutputY) return false;
         FluidState state = level.getFluidState(pos);
         return !state.isEmpty() && sameFluidKind(state.getType(), fluid) && !state.isSource();
     }
 
-    private static boolean placeFluidBlockAtOutlet(Level level, BlockPos pos, Fluid fluid) {
+    private static boolean canPlaceAirBlockAtOutlet(Level level, BlockPos pos, int maxOutputY) {
+        return pos.getY() <= maxOutputY && level.getBlockState(pos).isAir();
+    }
+
+    private static boolean isFlowingFluid(Level level, BlockPos pos, Fluid fluid) {
         FluidState state = level.getFluidState(pos);
-        if (state.isEmpty() || state.isSource() || !sameFluidKind(state.getType(), fluid)) return false;
+        return !state.isEmpty() && sameFluidKind(state.getType(), fluid) && !state.isSource();
+    }
+
+    private static boolean placeFluidBlockAtOutlet(Level level, BlockPos pos, Fluid fluid) {
+        if (!canPlaceAtOutlet(level, pos, fluid, pos.getY())) return false;
         if (isWater(fluid)) return level.setBlockAndUpdate(pos, Blocks.WATER.defaultBlockState());
         if (isLavaFluid(fluid)) return level.setBlockAndUpdate(pos, Blocks.LAVA.defaultBlockState());
         return false;
@@ -497,5 +521,5 @@ public final class PressureSupplementService {
             return pipe.relative(face);
         }
     }
-    private record WorldOutletTarget(OpenEnd end, BlockPos placePos, int searchDistance) {}
+    private record WorldOutletTarget(OpenEnd end, BlockPos placePos, int searchDistance, boolean flowing) {}
 }
