@@ -40,10 +40,16 @@ public final class PressureSupplementService {
     private static final int MAX_TANK_SETTLE_MB = 125;
     private static final int WORLD_BLOCK_MB = 1000;
     private static final int MAX_OUTLET_SEARCH = 16;
+    private static final int MOVED_SOURCE_SUPPRESSION_TICKS = 60;
     private static final double EPSILON = 0.01;
     private static final double DEAD_BAND = 0.05;
 
+    private static final Direction[] SOURCE_BREAK_DIRECTIONS = new Direction[] {
+            Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST, Direction.DOWN, Direction.UP
+    };
+
     private static final Map<Level, ProcessedTick> PROCESSED = new WeakHashMap<>();
+    private static final Map<Level, Map<BlockPos, Long>> RECENTLY_MOVED_SOURCES = new WeakHashMap<>();
 
     public static void tickPipe(FluidTransportBehaviour pipe) {
         Level level = pipe.getWorld();
@@ -178,81 +184,123 @@ public final class PressureSupplementService {
 
         for (OpenEnd sourceEnd : scan.openEnds) {
             BlockPos sourcePos = sourceEnd.worldPos();
+            if (recentlyMovedSource(level, sourcePos)) continue;
+
             FluidState sourceState = level.getFluidState(sourcePos);
             if (sourceState.isEmpty() || !sourceState.isSource()) continue;
 
             Fluid fluid = sourceFluidFor(sourceState.getType());
+            int maxOutputY = sourcePos.getY();
             double sourceHead = sourcePos.getY() + 1.0;
 
+            List<WorldOutletTarget> targets = new ArrayList<>();
             for (OpenEnd targetEnd : scan.openEnds) {
                 if (targetEnd.equals(sourceEnd)) continue;
-                if (targetEnd.pipe.getY() > sourceHead + EPSILON) continue;
+                if (targetEnd.pipe.getY() > maxOutputY) {
+                    DebugInfo.log(level, "SUPPLEMENT world transfer candidate rejected outlet={} reason=wouldPushUp source={} sourceY={} targetPipeY={}",
+                            targetEnd.worldPos(), sourcePos, sourcePos.getY(), targetEnd.pipe.getY());
+                    continue;
+                }
 
-                BlockPos placePos = outletPlacement(level, targetEnd.worldPos(), fluid);
+                BlockPos placePos = outletPlacement(level, targetEnd.worldPos(), fluid, maxOutputY);
                 if (placePos == null) continue;
-                if (!placeFluidBlockAtOutlet(level, placePos, fluid)) continue;
+                targets.add(new WorldOutletTarget(targetEnd, placePos, targetEnd.worldPos().distManhattan(placePos)));
+            }
 
-                level.setBlockAndUpdate(sourcePos, Blocks.AIR.defaultBlockState());
+            targets.sort(Comparator
+                    .comparingInt((WorldOutletTarget target) -> target.placePos.getY())
+                    .thenComparingInt(target -> target.searchDistance)
+                    .thenComparing(target -> target.placePos, PressureSupplementService::compareBlockPos));
+
+            for (WorldOutletTarget target : targets) {
+                if (!placeFluidBlockAtOutlet(level, target.placePos, fluid)) continue;
+
+                hardDeleteWorldSource(level, sourcePos, fluid);
+                markRecentlyMovedSource(level, sourcePos);
+                markRecentlyMovedSource(level, target.placePos);
                 DebugInfo.log(level,
-                        "SUPPLEMENT world transfer source={} target={} outlet={} fluid={} sourceHead={}",
-                        sourcePos, placePos, targetEnd.worldPos(), fluid, sourceHead);
+                        "SUPPLEMENT world transfer source={} target={} outlet={} fluid={} sourceHead={} searchDistance={} rule=downFirstFlowingOnly",
+                        sourcePos, target.placePos, target.end.worldPos(), fluid, sourceHead, target.searchDistance);
                 return WORLD_BLOCK_MB;
             }
 
-            DebugInfo.log(level, "SUPPLEMENT world transfer idle source={} reason=noFallbackOutlet", sourcePos);
+            DebugInfo.log(level, "SUPPLEMENT world transfer idle source={} reason=noDownwardFlowingOutlet", sourcePos);
         }
 
         return 0;
     }
 
-    private static BlockPos outletPlacement(Level level, BlockPos targetPos, Fluid fluid) {
+    private static boolean recentlyMovedSource(Level level, BlockPos pos) {
+        Map<BlockPos, Long> moved = RECENTLY_MOVED_SOURCES.get(level);
+        if (moved == null) return false;
+        Long until = moved.get(pos);
+        if (until == null) return false;
+        if (level.getGameTime() <= until) return true;
+        moved.remove(pos);
+        return false;
+    }
+
+    private static void markRecentlyMovedSource(Level level, BlockPos pos) {
+        RECENTLY_MOVED_SOURCES
+                .computeIfAbsent(level, $ -> new HashMap<>())
+                .put(pos, level.getGameTime() + MOVED_SOURCE_SUPPRESSION_TICKS);
+    }
+
+    private static void hardDeleteWorldSource(Level level, BlockPos sourcePos, Fluid fluid) {
+        level.setBlockAndUpdate(sourcePos, Blocks.AIR.defaultBlockState());
+
+        // Vanilla water can immediately remake an infinite source. Remove one adjacent
+        // matching source block as a breaker so a moved source actually leaves the inlet.
+        for (Direction direction : SOURCE_BREAK_DIRECTIONS) {
+            BlockPos breaker = sourcePos.relative(direction);
+            if (!level.isLoaded(breaker)) continue;
+            FluidState state = level.getFluidState(breaker);
+            if (!state.isSource() || !sameFluidKind(state.getType(), fluid)) continue;
+
+            level.setBlockAndUpdate(breaker, Blocks.AIR.defaultBlockState());
+            markRecentlyMovedSource(level, breaker);
+            DebugInfo.log(level, "SUPPLEMENT world transfer hardDeletedExtraSource source={} extra={} fluid={}", sourcePos, breaker, fluid);
+            return;
+        }
+    }
+
+    private static BlockPos outletPlacement(Level level, BlockPos targetPos, Fluid fluid, int maxOutputY) {
         if (!level.isLoaded(targetPos)) return null;
-        if (canPlaceFluidBlockAtOutlet(level, targetPos, fluid)) return targetPos;
+        if (canPlaceFlowingBlockAtOutlet(level, targetPos, fluid, maxOutputY)) return targetPos;
 
         Set<BlockPos> visited = new HashSet<>();
         ArrayDeque<Node> queue = new ArrayDeque<>();
         queue.add(new Node(targetPos, 0));
         visited.add(targetPos);
-        BlockPos closestAir = null;
-        int closestAirDistance = Integer.MAX_VALUE;
 
         while (!queue.isEmpty()) {
             Node node = queue.removeFirst();
             if (node.distance > MAX_OUTLET_SEARCH) continue;
 
-            FluidState state = level.getFluidState(node.pos);
-            if (!state.isEmpty() && sameFluidKind(state.getType(), fluid)) {
-                if (!state.isSource()) return node.pos;
-
-                for (Direction direction : Direction.values()) {
-                    BlockPos airCandidate = node.pos.relative(direction);
-                    if (!level.isLoaded(airCandidate)) continue;
-                    if (level.getBlockState(airCandidate).isAir() && node.distance + 1 < closestAirDistance) {
-                        closestAir = airCandidate;
-                        closestAirDistance = node.distance + 1;
-                    }
-                }
-            }
+            if (canPlaceFlowingBlockAtOutlet(level, node.pos, fluid, maxOutputY)) return node.pos;
 
             for (Direction direction : Direction.values()) {
                 BlockPos next = node.pos.relative(direction);
                 if (!level.isLoaded(next) || !visited.add(next)) continue;
                 FluidState nextState = level.getFluidState(next);
-                if (!nextState.isEmpty() && sameFluidKind(nextState.getType(), fluid)) queue.add(new Node(next, node.distance + 1));
+                if (!nextState.isEmpty() && sameFluidKind(nextState.getType(), fluid) && next.getY() <= maxOutputY) {
+                    queue.add(new Node(next, node.distance + 1));
+                }
             }
         }
 
-        return closestAir;
+        return null;
     }
 
-    private static boolean canPlaceFluidBlockAtOutlet(Level level, BlockPos pos, Fluid fluid) {
-        if (level.getBlockState(pos).isAir()) return true;
+    private static boolean canPlaceFlowingBlockAtOutlet(Level level, BlockPos pos, Fluid fluid, int maxOutputY) {
+        if (pos.getY() > maxOutputY) return false;
         FluidState state = level.getFluidState(pos);
         return !state.isEmpty() && sameFluidKind(state.getType(), fluid) && !state.isSource();
     }
 
     private static boolean placeFluidBlockAtOutlet(Level level, BlockPos pos, Fluid fluid) {
-        if (!canPlaceFluidBlockAtOutlet(level, pos, fluid)) return false;
+        FluidState state = level.getFluidState(pos);
+        if (state.isEmpty() || state.isSource() || !sameFluidKind(state.getType(), fluid)) return false;
         if (isWater(fluid)) return level.setBlockAndUpdate(pos, Blocks.WATER.defaultBlockState());
         if (isLavaFluid(fluid)) return level.setBlockAndUpdate(pos, Blocks.LAVA.defaultBlockState());
         return false;
@@ -400,4 +448,5 @@ public final class PressureSupplementService {
             return pipe.relative(face);
         }
     }
+    private record WorldOutletTarget(OpenEnd end, BlockPos placePos, int searchDistance) {}
 }
