@@ -16,7 +16,10 @@ import java.util.WeakHashMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.Fluid;
+import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.level.material.Fluids;
 import net.neoforged.neoforge.fluids.FluidStack;
 import net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction;
@@ -28,6 +31,8 @@ public final class TankPressureService {
     private static final int MAX_DISTANCE = 96;
     private static final int MAX_ROUTES = 32;
     private static final int MAX_HYDRAULIC_SETTLE_MB = 250;
+    private static final int MAX_WORLD_FILL_MB = 250;
+    private static final int WORLD_BLOCK_MB = 1000;
     private static final int SETTLE_EPSILON_MB = 25;
     private static final double HYDRAULIC_SETTLE_DEADBAND = 0.05;
     private static final double HYDRAULIC_SETTLE_FULL_HEAD = 1.0;
@@ -75,6 +80,9 @@ public final class TankPressureService {
         try {
             int settled = settleConnectedTanks(level, scan);
             if (settled > 0) DebugInfo.log(level, "HYDRAULIC settle owner={} moved={}mb", seed, settled);
+
+            int worldMoved = exchangeWithWorld(level, scan);
+            if (worldMoved > 0) DebugInfo.log(level, "WORLD exchange owner={} moved={}mb", seed, worldMoved);
 
             List<PressureRoute> routes = pressureRoutes(level, scan);
             if (routes.isEmpty()) {
@@ -262,6 +270,186 @@ public final class TankPressureService {
 
         if (movedTotal > 0) DebugInfo.log(level, "HYDRAULIC basin result moved={}mb planned={}mb", movedTotal, plannedTotal);
         return movedTotal;
+    }
+
+    private static int exchangeWithWorld(Level level, Scan scan) {
+        List<TankContact> contacts = tankContacts(level, scan);
+        if (contacts.isEmpty()) return 0;
+
+        int moved = 0;
+        for (End end : scan.ends) {
+            if (!end.openEnd || end.tank != null) continue;
+            BlockPos worldPos = end.pipe.relative(end.face);
+            if (!level.isLoaded(worldPos)) continue;
+
+            FluidState fluidState = level.getFluidState(worldPos);
+            if (fluidState.isSource()) {
+                moved += fillTanksFromWorldSource(level, scan, contacts, end, worldPos, fluidState, MAX_WORLD_FILL_MB - moved);
+            } else if (level.getBlockState(worldPos).isAir()) {
+                moved += drainTanksToWorld(level, scan, contacts, end, worldPos, MAX_WORLD_FILL_MB - moved);
+            } else {
+                DebugInfo.log(level, "WORLD skip end={} pos={} reason=blocked block={} fluid={}", end.name(), worldPos, level.getBlockState(worldPos).getBlock(), fluidState.getType());
+            }
+
+            if (moved >= MAX_WORLD_FILL_MB) break;
+        }
+        return moved;
+    }
+
+    private static int fillTanksFromWorldSource(Level level, Scan scan, List<TankContact> contacts, End source, BlockPos sourcePos, FluidState fluidState, int budget) {
+        if (budget <= 0) return 0;
+        Fluid fluid = fluidState.getType();
+        double sourceHead = source.head;
+        List<TankContact> targets = reachableContactsFrom(level, scan, contacts, source.pipe, sourceHead);
+        int moved = 0;
+
+        targets.sort((a, b) -> {
+            int surfaceCompare = Double.compare(surface(a.tank), surface(b.tank));
+            if (surfaceCompare != 0) return surfaceCompare;
+            int distanceCompare = Integer.compare(a.distance, b.distance);
+            if (distanceCompare != 0) return distanceCompare;
+            return compareBlockPos(a.tank.getController(), b.tank.getController());
+        });
+
+        for (TankContact target : targets) {
+            if (moved >= budget) break;
+            if (!canFillWith(target.tank, fluid)) continue;
+            if (target.cutoffSurface() > sourceHead + EPSILON) continue;
+
+            int current = target.tank.getTankInventory().getFluidAmount();
+            int maxAtSourceHead = amountForSurface(target.tank, Math.min(sourceHead, target.topY()));
+            int needed = maxAtSourceHead - current;
+            if (needed <= SETTLE_EPSILON_MB) continue;
+
+            int request = Math.min(budget - moved, Math.min(needed, curvedWorldBudget(sourceHead, surface(target.tank))));
+            if (request <= 0) continue;
+
+            FluidStack stack = new FluidStack(fluid, request);
+            int filled = target.tank.getTankInventory().fill(stack, FluidAction.EXECUTE);
+            if (filled <= 0) continue;
+
+            moved += filled;
+            DebugInfo.log(level, "WORLD fill source={} sourcePos={} target={} targetPipe={} moved={} requested={} sourceHead={} targetSurface={} cutoff={} fluid={}",
+                    source.name(), sourcePos, target.tank.getController(), target.pipe, filled, request, sourceHead, surface(target.tank), target.cutoffSurface(), fluid);
+        }
+
+        if (moved <= 0) DebugInfo.log(level, "WORLD fill idle source={} sourcePos={} sourceHead={} fluid={}", source.name(), sourcePos, sourceHead, fluid);
+        return moved;
+    }
+
+    private static int drainTanksToWorld(Level level, Scan scan, List<TankContact> contacts, End target, BlockPos worldPos, int budget) {
+        if (budget < WORLD_BLOCK_MB) return 0;
+        double targetHead = target.head;
+        List<TankContact> sources = reachableContactsFrom(level, scan, contacts, target.pipe, MAX_HEAD);
+        int moved = 0;
+
+        sources.sort((a, b) -> {
+            int surfaceCompare = Double.compare(surface(b.tank), surface(a.tank));
+            if (surfaceCompare != 0) return surfaceCompare;
+            int distanceCompare = Integer.compare(a.distance, b.distance);
+            if (distanceCompare != 0) return distanceCompare;
+            return compareBlockPos(a.tank.getController(), b.tank.getController());
+        });
+
+        for (TankContact source : sources) {
+            if (budget - moved < WORLD_BLOCK_MB) break;
+            if (!tankCanProvideToPipe(source.pipe, source.face, source.tank)) continue;
+
+            FluidStack fluid = source.tank.getTankInventory().getFluid();
+            if (fluid.isEmpty()) continue;
+            if (!canPlaceFluidBlock(fluid.getFluid())) {
+                DebugInfo.log(level, "WORLD drain skip source={} target={} reason=unsupportedFluid fluid={}", source.tank.getController(), worldPos, fluid.getFluid());
+                continue;
+            }
+
+            double sourceHead = surface(source.tank);
+            if (sourceHead <= targetHead + HYDRAULIC_SETTLE_DEADBAND) continue;
+
+            int sourceFloor = amountForSurface(source.tank, source.cutoffSurface());
+            int available = source.tank.getTankInventory().getFluidAmount() - sourceFloor;
+            if (available < WORLD_BLOCK_MB) continue;
+
+            FluidStack simulated = source.tank.getTankInventory().drain(WORLD_BLOCK_MB, FluidAction.SIMULATE);
+            if (simulated.isEmpty() || simulated.getAmount() < WORLD_BLOCK_MB) continue;
+
+            if (!placeFluidBlock(level, worldPos, simulated.getFluid())) {
+                DebugInfo.log(level, "WORLD drain skip source={} target={} reason=blockedAtPlace", source.tank.getController(), worldPos);
+                continue;
+            }
+
+            FluidStack drained = source.tank.getTankInventory().drain(WORLD_BLOCK_MB, FluidAction.EXECUTE);
+            if (drained.isEmpty()) {
+                level.setBlockAndUpdate(worldPos, Blocks.AIR.defaultBlockState());
+                continue;
+            }
+
+            moved += drained.getAmount();
+            DebugInfo.log(level, "WORLD drain source={} sourcePipe={} target={} moved={} sourceSurface={} cutoff={} targetHead={} fluid={}",
+                    source.tank.getController(), source.pipe, worldPos, drained.getAmount(), sourceHead, source.cutoffSurface(), targetHead, drained.getFluid());
+            break;
+        }
+
+        if (moved <= 0) DebugInfo.log(level, "WORLD drain idle target={} targetPos={} targetHead={}", target.name(), worldPos, targetHead);
+        return moved;
+    }
+
+    private static int curvedWorldBudget(double sourceHead, double targetSurface) {
+        double headDelta = sourceHead - targetSurface;
+        if (headDelta <= HYDRAULIC_SETTLE_DEADBAND) return 0;
+
+        double t = (headDelta - HYDRAULIC_SETTLE_DEADBAND) / HYDRAULIC_SETTLE_FULL_HEAD;
+        t = Math.max(0.0, Math.min(1.0, t));
+        double eased = t * t * (3.0 - (2.0 * t));
+        return Math.max(0, (int) Math.round(MAX_WORLD_FILL_MB * eased));
+    }
+
+    private static List<TankContact> reachableContactsFrom(Level level, Scan scan, List<TankContact> contacts, BlockPos startPipe, double maxPipeY) {
+        Map<BlockPos, List<TankContact>> byPipe = contactsByPipe(contacts);
+        Map<BlockPos, TankContact> bestByTank = new HashMap<>();
+        Set<BlockPos> visited = new HashSet<>();
+        ArrayDeque<Node> queue = new ArrayDeque<>();
+        queue.add(new Node(startPipe, 0));
+        visited.add(startPipe);
+
+        while (!queue.isEmpty()) {
+            Node node = queue.removeFirst();
+            List<TankContact> pipeContacts = byPipe.get(node.pos);
+            if (pipeContacts != null) {
+                for (TankContact candidate : pipeContacts) {
+                    BlockPos key = candidate.tank.getController();
+                    TankContact withDistance = candidate.withDistance(node.distance);
+                    TankContact previous = bestByTank.get(key);
+                    if (previous == null || withDistance.distance < previous.distance) bestByTank.put(key, withDistance);
+                }
+            }
+
+            FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, node.pos);
+            if (pipe == null) continue;
+            for (Direction face : FluidPropagator.getPipeConnections(level.getBlockState(node.pos), pipe)) {
+                BlockPos other = node.pos.relative(face);
+                if (!scan.pipes.contains(other)) continue;
+                if (other.getY() > maxPipeY + EPSILON) continue;
+                if (visited.add(other)) queue.add(new Node(other, node.distance + 1));
+            }
+        }
+
+        return new ArrayList<>(bestByTank.values());
+    }
+
+    private static boolean canFillWith(FluidTankBlockEntity tank, Fluid fluid) {
+        FluidStack existing = tank.getTankInventory().getFluid();
+        return existing.isEmpty() || FluidStack.isSameFluidSameComponents(existing, new FluidStack(fluid, 1));
+    }
+
+    private static boolean canPlaceFluidBlock(Fluid fluid) {
+        return fluid == Fluids.WATER || fluid == Fluids.FLOWING_WATER || fluid == Fluids.LAVA || fluid == Fluids.FLOWING_LAVA;
+    }
+
+    private static boolean placeFluidBlock(Level level, BlockPos pos, Fluid fluid) {
+        if (!level.getBlockState(pos).isAir()) return false;
+        if (fluid == Fluids.WATER || fluid == Fluids.FLOWING_WATER) return level.setBlockAndUpdate(pos, Blocks.WATER.defaultBlockState());
+        if (fluid == Fluids.LAVA || fluid == Fluids.FLOWING_LAVA) return level.setBlockAndUpdate(pos, Blocks.LAVA.defaultBlockState());
+        return false;
     }
 
     private static Map<BlockPos, Integer> snapshotAmounts(List<FluidTankBlockEntity> tanks) {
@@ -470,6 +658,10 @@ public final class TankPressureService {
                 if (tankToTank(source, target)) continue;
                 if (source.tank != null && target.openEnd) {
                     DebugInfo.log(level, "GRAPH skip raw tank drain source={} target={}", source.name(), target.name());
+                    continue;
+                }
+                if (source.openEnd && target.tank != null) {
+                    DebugInfo.log(level, "GRAPH skip raw world fill source={} target={}", source.name(), target.name());
                     continue;
                 }
 
