@@ -29,7 +29,8 @@ public final class TankPressureService {
     private static final int MAX_ROUTES = 32;
     private static final int MAX_HYDRAULIC_SETTLE_MB = 250;
     private static final int SETTLE_EPSILON_MB = 25;
-    private static final double HYDRAULIC_SETTLE_DEADBAND = 0.03;
+    private static final double HYDRAULIC_SETTLE_DEADBAND = 0.05;
+    private static final double HYDRAULIC_SETTLE_FULL_HEAD = 1.0;
 
     private static final float LAVA_PRESSURE_MULTIPLIER = 0.35f;
     private static final float TRICKLE_PRESSURE = 8.0f;
@@ -189,7 +190,8 @@ public final class TankPressureService {
             if (activeReceivers.isEmpty() || receiverCapacity <= SETTLE_EPSILON_MB) continue;
 
             int budget = Math.min(MAX_HYDRAULIC_SETTLE_MB - movedTotal, Math.min(sourceAvailable, receiverCapacity));
-            if (budget <= 0) break;
+            budget = Math.min(budget, curvedHydraulicBudget(sourceHead, activeReceivers));
+            if (budget <= 0) continue;
 
             int receiverCurrentTotal = 0;
             for (TankContact target : activeReceivers) receiverCurrentTotal += target.tank.getTankInventory().getFluidAmount();
@@ -233,6 +235,19 @@ public final class TankPressureService {
 
         if (movedTotal > 0) DebugInfo.log(level, "HYDRAULIC basin result moved={}mb", movedTotal);
         return movedTotal;
+    }
+
+    private static int curvedHydraulicBudget(double sourceHead, List<TankContact> activeReceivers) {
+        double lowestReceiverSurface = sourceHead;
+        for (TankContact target : activeReceivers) lowestReceiverSurface = Math.min(lowestReceiverSurface, surface(target.tank));
+
+        double headDelta = sourceHead - lowestReceiverSurface;
+        if (headDelta <= HYDRAULIC_SETTLE_DEADBAND) return 0;
+
+        double t = (headDelta - HYDRAULIC_SETTLE_DEADBAND) / HYDRAULIC_SETTLE_FULL_HEAD;
+        t = Math.max(0.0, Math.min(1.0, t));
+        double eased = t * t * (3.0 - (2.0 * t));
+        return Math.max(0, (int) Math.round(MAX_HYDRAULIC_SETTLE_MB * eased));
     }
 
     private static List<TankContact> reachableHydraulicTargets(Level level, Scan scan, List<TankContact> contacts, TankContact source) {
