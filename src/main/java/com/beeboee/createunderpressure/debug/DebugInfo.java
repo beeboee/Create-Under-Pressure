@@ -28,6 +28,7 @@ import net.minecraft.world.level.material.FluidState;
 public final class DebugInfo {
     private DebugInfo() {}
 
+    private static final String DEBUG_BUILD = "pressure-graph-v0.1.2/e2550f6+";
     private static final int DEFAULT_SECONDS = 10;
     private static final int MAX_FILENAME_LABEL_LENGTH = 64;
     private static final int LOOSE_TARGET_RADIUS = 8;
@@ -81,7 +82,8 @@ public final class DebugInfo {
         activePlayerId = player.getUUID();
         activeStack = stack;
         endedMessageSent = false;
-        selectedTarget = target == null ? null : target.immutable();
+        if (target != null) selectedTarget = target.immutable();
+        else if (!extending) selectedTarget = null;
         setGlint(stack, true);
 
         if (!extending || activeLogFile == null) activeLogFile = newLogFile(player);
@@ -89,8 +91,8 @@ public final class DebugInfo {
         long remainingSeconds = Math.max(0, (debugUntilGameTime - now + 19L) / 20L);
         String scope = selectedTarget == null ? "global" : "network near " + selectedTarget.toShortString();
         Component message = Component.literal(extending
-            ? "Create: Under Pressure debug logging extended by " + seconds + " seconds (" + remainingSeconds + "s remaining, " + scope + ")"
-            : "Create: Under Pressure debug logging enabled for " + seconds + " seconds (" + scope + ")");
+            ? "Create: Under Pressure debug logging extended by " + seconds + " seconds (" + remainingSeconds + "s remaining, " + scope + ", build " + DEBUG_BUILD + ")"
+            : "Create: Under Pressure debug logging enabled for " + seconds + " seconds (" + scope + ", build " + DEBUG_BUILD + ")");
 
         player.displayClientMessage(message, true);
         writeLine("SESSION " + message.getString());
@@ -104,7 +106,7 @@ public final class DebugInfo {
         setGlint(activeStack, false);
 
         ServerPlayer player = activePlayerId == null ? null : level.getServer().getPlayerList().getPlayer(activePlayerId);
-        Component message = Component.literal("Create: Under Pressure debug logging finished");
+        Component message = Component.literal("Create: Under Pressure debug logging finished (build " + DEBUG_BUILD + ")");
         if (player != null) player.displayClientMessage(message, true);
 
         writeLine("SESSION " + message.getString());
@@ -176,9 +178,7 @@ public final class DebugInfo {
         FluidState fluidState = level.getFluidState(pos);
 
         if (blockState.isAir()) return "air/sourceAirFlow=flowing";
-        if (!fluidState.isEmpty()) {
-            return "fluid=" + fluidState.getType() + "/source=" + fluidState.isSource() + "/sourceAirFlow=blocked";
-        }
+        if (!fluidState.isEmpty()) return "fluid=" + fluidState.getType() + "/source=" + fluidState.isSource() + "/sourceAirFlow=blocked";
         return "block=" + blockState.getBlock() + "/sourceAirFlow=blocked";
     }
 
@@ -220,7 +220,7 @@ public final class DebugInfo {
         endedMessageSent = true;
         setGlint(activeStack, false);
 
-        Component message = Component.literal(text);
+        Component message = Component.literal(text + " (build " + DEBUG_BUILD + ")");
         player.displayClientMessage(message, true);
         writeLine("SESSION " + message.getString());
         CreateUnderPressure.LOGGER.info("{}", message.getString());
