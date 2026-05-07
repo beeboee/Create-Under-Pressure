@@ -1,6 +1,6 @@
 # Create: Under Pressure
 
-Current dev version: `0.1.1`
+Current dev version: `0.1.2`
 
 A Create addon that adds fluid pressure to Create's existing pipe and fluid systems.
 
@@ -14,6 +14,17 @@ This is being built for:
 - Java `21`
 
 ## Version notes
+
+### `0.1.2`
+
+Head-graph pressure pass:
+
+- Replaced the single best-source route picker with a graph-style head solver.
+- Pipe networks now evaluate all valid higher-head endpoints against lower-head receivers instead of stopping at one selected source.
+- Removed the old blocker/ownership path logic that caused larger multi-tank networks to repeatedly report `GRAPH blocked`.
+- Added simple pipe resistance based on route length so longer paths apply less pressure than short direct paths.
+- Tank-to-tank pressure now keeps most of its head force instead of being heavily reduced.
+- Debug output now reports `GRAPH settle` and per-route head/conductance/pressure details.
 
 ### `0.1.1`
 
