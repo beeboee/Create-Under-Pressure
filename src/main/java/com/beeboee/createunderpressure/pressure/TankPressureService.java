@@ -19,6 +19,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.Fluids;
 import net.neoforged.neoforge.fluids.FluidStack;
+import net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction;
 
 public final class TankPressureService {
     private TankPressureService() {}
@@ -26,12 +27,14 @@ public final class TankPressureService {
     private static final int TICK_INTERVAL = 5;
     private static final int MAX_DISTANCE = 96;
     private static final int MAX_ROUTES = 32;
+    private static final int MAX_HYDRAULIC_SETTLE_MB = 250;
+    private static final int SETTLE_EPSILON_MB = 25;
 
     private static final float LAVA_PRESSURE_MULTIPLIER = 0.35f;
     private static final float TRICKLE_PRESSURE = 8.0f;
     private static final float MAX_PRESSURE = 256.0f;
 
-    private static final float TANK_SETTLE_MAX_PRESSURE = 0.55f;
+    private static final float TANK_SETTLE_MAX_PRESSURE = 0.25f;
     private static final double TANK_SETTLE_DEADBAND = 0.35;
     private static final double TANK_SETTLE_FULL_HEAD = 4.0;
 
@@ -46,7 +49,7 @@ public final class TankPressureService {
 
     public static void tickTank(FluidTankBlockEntity tank) {
         // Intentionally disabled. Tank movement should come from connected pipe pressure,
-        // not direct tank-to-tank inventory transfers.
+        // not direct cosmetic tank-to-tank inventory transfers.
     }
 
     public static void tickPipe(FluidTransportBehaviour pipe) {
@@ -63,6 +66,9 @@ public final class TankPressureService {
         if (!ownsPipeNetwork(scan, seed)) return;
         if (overlaps(scan.pipes, processed.pipes)) return;
         processed.pipes.addAll(scan.pipes);
+
+        int settled = settleConnectedTanks(level, scan);
+        if (settled > 0) DebugInfo.log(level, "HYDRAULIC settle owner={} moved={}mb", seed, settled);
 
         List<PressureRoute> routes = pressureRoutes(level, scan);
         if (routes.isEmpty()) {
@@ -141,6 +147,130 @@ public final class TankPressureService {
         return new Scan(pipes, ends);
     }
 
+    private static int settleConnectedTanks(Level level, Scan scan) {
+        List<FluidTankBlockEntity> tanks = uniqueTanks(scan);
+        if (tanks.size() < 2) return 0;
+        if (!singleFluidGroup(tanks)) return 0;
+
+        int total = 0;
+        int totalCapacity = 0;
+        for (FluidTankBlockEntity tank : tanks) {
+            total += tank.getTankInventory().getFluidAmount();
+            totalCapacity += tank.getTankInventory().getCapacity();
+        }
+        if (total <= 0 || total >= totalCapacity) return 0;
+
+        double targetSurface = networkSurfaceForAmount(tanks, total);
+        List<TankDelta> sources = new ArrayList<>();
+        List<TankDelta> targets = new ArrayList<>();
+
+        for (FluidTankBlockEntity tank : tanks) {
+            int current = tank.getTankInventory().getFluidAmount();
+            int target = amountForSurface(tank, targetSurface);
+            int delta = current - target;
+            if (delta > SETTLE_EPSILON_MB) sources.add(new TankDelta(tank, delta));
+            if (delta < -SETTLE_EPSILON_MB) targets.add(new TankDelta(tank, -delta));
+        }
+
+        if (sources.isEmpty() || targets.isEmpty()) return 0;
+        sources.sort((a, b) -> Double.compare(surface(b.tank) - targetSurface, surface(a.tank) - targetSurface));
+        targets.sort((a, b) -> Double.compare(targetSurface - surface(b.tank), targetSurface - surface(a.tank)));
+
+        int movedTotal = 0;
+        int sourceIndex = 0;
+        for (TankDelta target : targets) {
+            int needed = target.amount;
+            while (needed > SETTLE_EPSILON_MB && sourceIndex < sources.size()) {
+                TankDelta source = sources.get(sourceIndex);
+                if (source.amount <= SETTLE_EPSILON_MB) {
+                    sourceIndex++;
+                    continue;
+                }
+
+                int move = Math.min(MAX_HYDRAULIC_SETTLE_MB - movedTotal, Math.min(source.amount, needed));
+                if (move <= 0) return movedTotal;
+
+                int moved = moveFluid(source.tank, target.tank, move);
+                if (moved <= 0) {
+                    sourceIndex++;
+                    continue;
+                }
+
+                movedTotal += moved;
+                source.amount -= moved;
+                needed -= moved;
+
+                if (movedTotal >= MAX_HYDRAULIC_SETTLE_MB) return movedTotal;
+            }
+        }
+
+        if (movedTotal > 0) {
+            DebugInfo.log(level, "HYDRAULIC targetSurface={} tanks={} moved={}mb", targetSurface, tanks.size(), movedTotal);
+        }
+        return movedTotal;
+    }
+
+    private static List<FluidTankBlockEntity> uniqueTanks(Scan scan) {
+        Map<BlockPos, FluidTankBlockEntity> tanks = new HashMap<>();
+        for (End end : scan.ends) {
+            if (end.tank != null) tanks.putIfAbsent(end.tank.getController(), end.tank);
+        }
+        return new ArrayList<>(tanks.values());
+    }
+
+    private static boolean singleFluidGroup(List<FluidTankBlockEntity> tanks) {
+        FluidStack group = FluidStack.EMPTY;
+        for (FluidTankBlockEntity tank : tanks) {
+            FluidStack fluid = tank.getTankInventory().getFluid();
+            if (fluid.isEmpty()) continue;
+            if (group.isEmpty()) {
+                group = fluid;
+                continue;
+            }
+            if (!FluidStack.isSameFluidSameComponents(group, fluid)) return false;
+        }
+        return !group.isEmpty();
+    }
+
+    private static double networkSurfaceForAmount(List<FluidTankBlockEntity> tanks, int totalAmount) {
+        double low = Double.MAX_VALUE;
+        double high = -Double.MAX_VALUE;
+        for (FluidTankBlockEntity tank : tanks) {
+            low = Math.min(low, tank.getController().getY());
+            high = Math.max(high, tank.getController().getY() + tank.getHeight());
+        }
+
+        for (int i = 0; i < 48; i++) {
+            double mid = (low + high) * 0.5;
+            int amount = 0;
+            for (FluidTankBlockEntity tank : tanks) amount += amountForSurface(tank, mid);
+            if (amount < totalAmount) low = mid;
+            else high = mid;
+        }
+
+        return (low + high) * 0.5;
+    }
+
+    private static int moveFluid(FluidTankBlockEntity from, FluidTankBlockEntity to, int amount) {
+        FluidStack simulatedDrain = from.getTankInventory().drain(amount, FluidAction.SIMULATE);
+        if (simulatedDrain.isEmpty()) return 0;
+
+        int canFill = to.getTankInventory().fill(simulatedDrain, FluidAction.SIMULATE);
+        int actual = Math.min(amount, canFill);
+        if (actual <= 0) return 0;
+
+        FluidStack drained = from.getTankInventory().drain(actual, FluidAction.EXECUTE);
+        if (drained.isEmpty()) return 0;
+
+        int filled = to.getTankInventory().fill(drained, FluidAction.EXECUTE);
+        if (filled < drained.getAmount()) {
+            FluidStack remainder = drained.copy();
+            remainder.setAmount(drained.getAmount() - filled);
+            from.getTankInventory().fill(remainder, FluidAction.EXECUTE);
+        }
+        return filled;
+    }
+
     private static List<PressureRoute> pressureRoutes(Level level, Scan scan) {
         Map<String, PressureRoute> bestRoutesByTarget = new HashMap<>();
 
@@ -150,6 +280,7 @@ public final class TankPressureService {
             for (End target : scan.ends) {
                 if (source == target) continue;
                 if (!canReceiveFrom(source, target)) continue;
+                if (tankToTank(source, target)) continue;
 
                 double head = source.head - target.head;
                 double requiredHead = requiredHead(source, target);
@@ -432,6 +563,11 @@ public final class TankPressureService {
     private record Scan(Set<BlockPos> pipes, List<End> ends) {}
     private record Node(BlockPos pos, int distance) {}
     private record Step(BlockPos from, Direction fromFace, BlockPos to, Direction toFace) {}
+    private record TankDelta(FluidTankBlockEntity tank, int amount) {
+        private TankDelta withAmount(int amount) {
+            return new TankDelta(tank, amount);
+        }
+    }
     private record PressureRoute(End source, End target, List<Step> path, double head, double activeHead, double conductance, float pressure) {}
     private record ProcessedTick(long gameTime, Set<BlockPos> pipes) {}
 
