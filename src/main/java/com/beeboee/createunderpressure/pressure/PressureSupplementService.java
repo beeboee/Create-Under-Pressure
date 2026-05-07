@@ -284,15 +284,16 @@ public final class PressureSupplementService {
             if (sourceState.isEmpty() || !sourceState.isSource()) continue;
 
             Fluid fluid = sourceFluidFor(sourceState.getType());
-            int maxOutputY = sourcePos.getY();
             double sourceHead = sourcePos.getY() + 1.0;
 
             List<WorldOutletTarget> targets = new ArrayList<>();
             for (OpenEnd targetEnd : scan.openEnds) {
                 if (targetEnd.equals(sourceEnd)) continue;
-                if (targetEnd.pipe.getY() > maxOutputY) {
-                    DebugInfo.log(level, "SUPPLEMENT world transfer candidate rejected outlet={} reason=wouldPushUp source={} sourceY={} targetPipeY={}",
-                            targetEnd.worldPos(), sourcePos, sourcePos.getY(), targetEnd.pipe.getY());
+
+                int maxOutputY = Math.max(sourcePos.getY(), targetEnd.worldPos().getY());
+                if (targetEnd.worldPos().getY() > maxOutputY) {
+                    DebugInfo.log(level, "SUPPLEMENT world transfer candidate rejected outlet={} reason=aboveOutletFillCap source={} sourceY={} outletY={} capY={}",
+                            targetEnd.worldPos(), sourcePos, sourcePos.getY(), targetEnd.worldPos().getY(), maxOutputY);
                     continue;
                 }
 
@@ -303,7 +304,7 @@ public final class PressureSupplementService {
 
                 BlockPos placePos = outletPlacement(level, targetEnd.worldPos(), fluid, maxOutputY, sourcePos);
                 if (placePos == null) continue;
-                targets.add(new WorldOutletTarget(targetEnd, placePos, targetEnd.worldPos().distManhattan(placePos), isFlowingFluid(level, placePos, fluid)));
+                targets.add(new WorldOutletTarget(targetEnd, placePos, targetEnd.worldPos().distManhattan(placePos), isFlowingFluid(level, placePos, fluid), maxOutputY));
             }
 
             targets.sort(Comparator
@@ -319,12 +320,12 @@ public final class PressureSupplementService {
                 markRecentlyMovedSource(level, sourcePos);
                 markRecentlyMovedSource(level, target.placePos);
                 DebugInfo.log(level,
-                        "SUPPLEMENT world transfer source={} target={} outlet={} fluid={} sourceHead={} searchDistance={} flowingTarget={} rule=flowingFirstDownNoSameBody",
-                        sourcePos, target.placePos, target.end.worldPos(), fluid, sourceHead, target.searchDistance, target.flowing);
+                        "SUPPLEMENT world transfer source={} target={} outlet={} fluid={} sourceHead={} searchDistance={} flowingTarget={} capY={} rule=flowingFirstFillToOutletEndNoSameBody",
+                        sourcePos, target.placePos, target.end.worldPos(), fluid, sourceHead, target.searchDistance, target.flowing, target.maxOutputY);
                 return WORLD_BLOCK_MB;
             }
 
-            DebugInfo.log(level, "SUPPLEMENT world transfer idle source={} reason=noSeparateDownwardOutlet", sourcePos);
+            DebugInfo.log(level, "SUPPLEMENT world transfer idle source={} reason=noSeparateOutletWithinOutletFillCap", sourcePos);
         }
 
         return 0;
@@ -606,5 +607,5 @@ public final class PressureSupplementService {
             return pipe.relative(face);
         }
     }
-    private record WorldOutletTarget(OpenEnd end, BlockPos placePos, int searchDistance, boolean flowing) {}
+    private record WorldOutletTarget(OpenEnd end, BlockPos placePos, int searchDistance, boolean flowing, int maxOutputY) {}
 }
