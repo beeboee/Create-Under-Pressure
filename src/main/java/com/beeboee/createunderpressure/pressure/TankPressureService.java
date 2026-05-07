@@ -12,6 +12,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.WeakHashMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
@@ -27,17 +28,19 @@ public final class TankPressureService {
     private static final int MAX_ROUTES = 32;
 
     private static final float LAVA_PRESSURE_MULTIPLIER = 0.35f;
-    private static final float TANK_TO_TANK_PRESSURE_MULTIPLIER = 0.85f;
+    private static final float TANK_TO_TANK_PRESSURE_MULTIPLIER = 0.12f;
+    private static final float TANK_TO_TANK_MAX_PRESSURE = 1.25f;
     private static final float TRICKLE_PRESSURE = 8.0f;
-    private static final float MIN_PRESSURE = 16.0f;
     private static final float MAX_PRESSURE = 256.0f;
 
     private static final double DEAD_HEAD = 0.125;
-    private static final double TANK_SETTLE_HEAD = 0.5;
+    private static final double TANK_SETTLE_HEAD = 0.0;
     private static final double TRICKLE_HEAD = 1.0;
     private static final double MAX_HEAD = 32.0;
     private static final double PIPE_RESISTANCE_PER_STEP = 0.08;
     private static final double EPSILON = 0.01;
+
+    private static final Map<Level, ProcessedTick> PROCESSED = new WeakHashMap<>();
 
     public static void tickTank(FluidTankBlockEntity tank) {
         // Intentionally disabled. Tank movement should come from connected pipe pressure,
@@ -50,9 +53,14 @@ public final class TankPressureService {
         if (level.getGameTime() % TICK_INTERVAL != 0) return;
 
         BlockPos seed = pipe.getPos();
+        ProcessedTick processed = processed(level);
+        if (processed.pipes.contains(seed)) return;
+
         Scan scan = scan(level, seed);
         if (scan == null || scan.pipes.isEmpty()) return;
         if (!ownsPipeNetwork(scan, seed)) return;
+        if (overlaps(scan.pipes, processed.pipes)) return;
+        processed.pipes.addAll(scan.pipes);
 
         List<PressureRoute> routes = pressureRoutes(level, scan);
         if (routes.isEmpty()) {
@@ -62,6 +70,23 @@ public final class TankPressureService {
 
         DebugInfo.log(level, "GRAPH settle owner={} routes={} endpoints={} pipes={}", seed, routes.size(), scan.ends.size(), scan.pipes.size());
         for (PressureRoute route : routes) apply(level, route);
+    }
+
+    private static ProcessedTick processed(Level level) {
+        long gameTime = level.getGameTime();
+        ProcessedTick processed = PROCESSED.get(level);
+        if (processed == null || processed.gameTime != gameTime) {
+            processed = new ProcessedTick(gameTime, new HashSet<>());
+            PROCESSED.put(level, processed);
+        }
+        return processed;
+    }
+
+    private static boolean overlaps(Set<BlockPos> scanPipes, Set<BlockPos> processedPipes) {
+        for (BlockPos pipe : scanPipes) {
+            if (processedPipes.contains(pipe)) return true;
+        }
+        return false;
     }
 
     private static Scan scan(Level level, BlockPos seed) {
@@ -115,7 +140,7 @@ public final class TankPressureService {
     }
 
     private static List<PressureRoute> pressureRoutes(Level level, Scan scan) {
-        Map<RouteKey, PressureRoute> bestRoutes = new HashMap<>();
+        Map<String, PressureRoute> bestRoutesByTarget = new HashMap<>();
 
         for (End source : scan.ends) {
             if (!source.provides) continue;
@@ -133,17 +158,17 @@ public final class TankPressureService {
 
                 double activeHead = head - requiredHead;
                 double conductance = conductance(path);
-                float pressure = pressureForHead(activeHead) * (float) conductance * pressureMultiplier(source, target);
+                float pressure = routePressure(source, target, activeHead, conductance);
                 if (pressure <= 0) continue;
 
                 PressureRoute route = new PressureRoute(source, target, path, head, activeHead, conductance, pressure);
-                RouteKey key = new RouteKey(source.nodeKey(), target.nodeKey());
-                PressureRoute previous = bestRoutes.get(key);
-                if (previous == null || routeScore(route) > routeScore(previous)) bestRoutes.put(key, route);
+                String key = target.nodeKey();
+                PressureRoute previous = bestRoutesByTarget.get(key);
+                if (previous == null || routeScore(route) > routeScore(previous)) bestRoutesByTarget.put(key, route);
             }
         }
 
-        List<PressureRoute> routes = new ArrayList<>(bestRoutes.values());
+        List<PressureRoute> routes = new ArrayList<>(bestRoutesByTarget.values());
         routes.sort((a, b) -> {
             int pressureCompare = Float.compare(b.pressure, a.pressure);
             if (pressureCompare != 0) return pressureCompare;
@@ -154,6 +179,12 @@ public final class TankPressureService {
 
         if (routes.size() <= MAX_ROUTES) return routes;
         return new ArrayList<>(routes.subList(0, MAX_ROUTES));
+    }
+
+    private static float routePressure(End source, End target, double activeHead, double conductance) {
+        float pressure = pressureForHead(activeHead) * (float) conductance * pressureMultiplier(source, target);
+        if (tankToTank(source, target)) pressure = Math.min(pressure, TANK_TO_TANK_MAX_PRESSURE);
+        return pressure;
     }
 
     private static double routeScore(PressureRoute route) {
@@ -326,7 +357,7 @@ public final class TankPressureService {
             return (float) (TRICKLE_PRESSURE * t * (2.0 - t));
         }
         double t = Math.min(1.0, (head - TRICKLE_HEAD) / (MAX_HEAD - TRICKLE_HEAD));
-        return (float) (MIN_PRESSURE + (t * t * (MAX_PRESSURE - MIN_PRESSURE)));
+        return (float) (TRICKLE_PRESSURE + (t * t * (MAX_PRESSURE - TRICKLE_PRESSURE)));
     }
 
     private static FluidTankBlockEntity tankAt(Level level, BlockPos pos) {
@@ -392,8 +423,8 @@ public final class TankPressureService {
     private record Scan(Set<BlockPos> pipes, List<End> ends) {}
     private record Node(BlockPos pos, int distance) {}
     private record Step(BlockPos from, Direction fromFace, BlockPos to, Direction toFace) {}
-    private record RouteKey(String source, String target) {}
     private record PressureRoute(End source, End target, List<Step> path, double head, double activeHead, double conductance, float pressure) {}
+    private record ProcessedTick(long gameTime, Set<BlockPos> pipes) {}
 
     private static final class End {
         final BlockPos pipe;
