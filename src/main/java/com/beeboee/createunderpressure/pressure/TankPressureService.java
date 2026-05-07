@@ -36,6 +36,9 @@ public final class TankPressureService {
     private static final int WORLD_BLOCK_MB = 1000;
     private static final int SETTLE_EPSILON_MB = 25;
     private static final int MAX_WORLD_SOURCE_SEARCH = 96;
+    private static final int MAX_WORLD_OUTLET_SEARCH = 16;
+    private static final int CONSUMED_SOURCE_SUPPRESSION_TICKS = 40;
+    private static final int WORLD_TRANSFER_INTERVAL_TICKS = 10;
     private static final double HYDRAULIC_SETTLE_DEADBAND = 0.05;
     private static final double HYDRAULIC_SETTLE_FULL_HEAD = 1.0;
 
@@ -56,6 +59,7 @@ public final class TankPressureService {
 
     private static final Map<Level, ProcessedTick> PROCESSED = new WeakHashMap<>();
     private static final Map<Level, Map<BlockPos, Integer>> WORLD_SOURCE_DRAWS = new WeakHashMap<>();
+    private static final Map<Level, Map<BlockPos, Long>> RECENTLY_CONSUMED_WORLD_SOURCES = new WeakHashMap<>();
 
     public static void tickTank(FluidTankBlockEntity tank) {
         // Intentionally disabled. Tank movement should come from connected pipe pressure,
@@ -305,7 +309,11 @@ public final class TankPressureService {
                 }
             } else if (level.getBlockState(worldPos).isAir()) {
                 if (!contacts.isEmpty()) {
-                    outputMoved += drainTanksToWorld(level, scan, contacts, end, worldPos, MAX_WORLD_OUTPUT_MB - outputMoved);
+                    if (intakeMoved > 0) {
+                        DebugInfo.log(level, "WORLD drain skip target={} targetPos={} reason=intakePriority intakeMoved={}", end.name(), worldPos, intakeMoved);
+                    } else {
+                        outputMoved += drainTanksToWorld(level, scan, contacts, end, worldPos, MAX_WORLD_OUTPUT_MB - outputMoved);
+                    }
                 }
             } else {
                 DebugInfo.log(level, "WORLD skip end={} pos={} reason=blocked block={} fluid={}", end.name(), worldPos, level.getBlockState(worldPos).getBlock(), fluidState.getType());
@@ -320,6 +328,10 @@ public final class TankPressureService {
         if (touchedState.isEmpty()) return null;
         Fluid touchedFluid = touchedState.getType();
         if (touchedState.isSource()) {
+            if (recentlyConsumedWorldSource(level, touchedPos)) {
+                DebugInfo.log(level, "WORLD intake skip touched={} reason=recentlyConsumedSource fluid={}", touchedPos, touchedState.getType());
+                return null;
+            }
             Fluid sourceFluid = sourceFluidFor(touchedFluid);
             DebugInfo.log(level, "WORLD intake sourceResolved touched={} source={} distance=0 fluid={} touchedSource=true", touchedPos, touchedPos, sourceFluid);
             return new WorldIntake(touchedPos, touchedPos, sourceFluid, 0, true);
@@ -337,6 +349,10 @@ public final class TankPressureService {
             FluidState state = level.getFluidState(node.pos);
             if (!sameFluidKind(touchedFluid, state.getType())) continue;
             if (state.isSource()) {
+                if (recentlyConsumedWorldSource(level, node.pos)) {
+                    DebugInfo.log(level, "WORLD intake skip candidate={} touched={} reason=recentlyConsumedSource fluid={}", node.pos, touchedPos, state.getType());
+                    continue;
+                }
                 Fluid sourceFluid = sourceFluidFor(state.getType());
                 DebugInfo.log(level, "WORLD intake sourceResolved touched={} source={} distance={} fluid={} touchedSource=false", touchedPos, node.pos, node.distance, sourceFluid);
                 return new WorldIntake(touchedPos, node.pos, sourceFluid, node.distance, false);
@@ -355,6 +371,24 @@ public final class TankPressureService {
         return null;
     }
 
+    private static boolean recentlyConsumedWorldSource(Level level, BlockPos pos) {
+        Map<BlockPos, Long> consumed = RECENTLY_CONSUMED_WORLD_SOURCES.get(level);
+        if (consumed == null) return false;
+
+        Long until = consumed.get(pos);
+        if (until == null) return false;
+        if (level.getGameTime() <= until) return true;
+
+        consumed.remove(pos);
+        return false;
+    }
+
+    private static void markRecentlyConsumedWorldSource(Level level, BlockPos pos) {
+        RECENTLY_CONSUMED_WORLD_SOURCES
+                .computeIfAbsent(level, $ -> new HashMap<>())
+                .put(pos, level.getGameTime() + CONSUMED_SOURCE_SUPPRESSION_TICKS);
+    }
+
     private static void recordWorldSourceDraw(Level level, WorldIntake intake, int amount) {
         Map<BlockPos, Integer> draws = WORLD_SOURCE_DRAWS.computeIfAbsent(level, $ -> new HashMap<>());
         int total = draws.getOrDefault(intake.sourcePos, 0) + amount;
@@ -367,8 +401,10 @@ public final class TankPressureService {
         FluidState current = level.getFluidState(intake.sourcePos);
         if (!current.isEmpty() && current.isSource() && sameFluidKind(current.getType(), intake.fluid)) {
             level.setBlockAndUpdate(intake.sourcePos, Blocks.AIR.defaultBlockState());
+            markRecentlyConsumedWorldSource(level, intake.sourcePos);
             DebugInfo.log(level, "WORLD intake consumedSource source={} fluid={} pulled={} touched={} distance={}", intake.sourcePos, intake.fluid, total, intake.touchedPos, intake.distance);
         } else {
+            markRecentlyConsumedWorldSource(level, intake.sourcePos);
             DebugInfo.log(level, "WORLD intake sourceGone source={} fluid={} pulled={} touched={} distance={}", intake.sourcePos, intake.fluid, total, intake.touchedPos, intake.distance);
         }
     }
@@ -419,40 +455,89 @@ public final class TankPressureService {
             DebugInfo.log(level, "WORLD transfer skip source={} reason=budgetBelowBlock budget={}", source.name(), budget);
             return 0;
         }
+        if (level.getGameTime() % WORLD_TRANSFER_INTERVAL_TICKS != 0) {
+            DebugInfo.log(level, "WORLD transfer skip source={} reason=rateLimited tick={} interval={}", source.name(), level.getGameTime(), WORLD_TRANSFER_INTERVAL_TICKS);
+            return 0;
+        }
 
         double sourceHead = intake.sourcePos.getY() + 1.0;
-        List<End> targets = new ArrayList<>();
+        List<WorldOutletTarget> targets = new ArrayList<>();
         for (End target : scan.ends) {
             if (target == source || !target.openEnd || target.tank != null) continue;
             BlockPos targetPos = target.pipe.relative(target.face);
             if (!level.isLoaded(targetPos)) continue;
-            if (!level.getBlockState(targetPos).isAir()) continue;
             if (target.pipe.getY() > sourceHead + EPSILON) continue;
             if (path(level, scan, source, target.pipe) == null) continue;
-            targets.add(target);
+
+            BlockPos placePos = outletPlacement(level, targetPos, intake.fluid);
+            if (placePos == null) continue;
+            targets.add(new WorldOutletTarget(target, placePos, targetPos.distManhattan(placePos)));
         }
 
         targets.sort((a, b) -> {
-            int yCompare = Integer.compare(a.pipe.relative(a.face).getY(), b.pipe.relative(b.face).getY());
+            int searchCompare = Integer.compare(a.searchDistance, b.searchDistance);
+            if (searchCompare != 0) return searchCompare;
+            int yCompare = Integer.compare(a.placePos.getY(), b.placePos.getY());
             if (yCompare != 0) return yCompare;
-            return compareBlockPos(a.pipe, b.pipe);
+            return compareBlockPos(a.placePos, b.placePos);
         });
 
-        for (End target : targets) {
-            BlockPos targetPos = target.pipe.relative(target.face);
-            if (!placeFluidBlock(level, targetPos, intake.fluid)) {
-                DebugInfo.log(level, "WORLD transfer skip source={} target={} reason=blockedAtPlace", source.name(), targetPos);
+        for (WorldOutletTarget target : targets) {
+            if (!placeFluidBlockAtOutlet(level, target.placePos, intake.fluid)) {
+                DebugInfo.log(level, "WORLD transfer skip source={} target={} reason=blockedAtPlace", source.name(), target.placePos);
                 continue;
             }
 
             recordWorldSourceDraw(level, intake, WORLD_BLOCK_MB);
-            DebugInfo.log(level, "WORLD transfer source={} touchedPos={} sourcePos={} target={} moved={} fluid={} sourceDistance={}",
-                    source.name(), intake.touchedPos, intake.sourcePos, targetPos, WORLD_BLOCK_MB, intake.fluid, intake.distance);
+            DebugInfo.log(level, "WORLD transfer source={} touchedPos={} sourcePos={} target={} outlet={} moved={} fluid={} sourceDistance={} outletSearchDistance={}",
+                    source.name(), intake.touchedPos, intake.sourcePos, target.placePos, target.end.name(), WORLD_BLOCK_MB, intake.fluid, intake.distance, target.searchDistance);
             return WORLD_BLOCK_MB;
         }
 
         DebugInfo.log(level, "WORLD transfer idle source={} touchedPos={} sourcePos={} reason=noValidOutlet", source.name(), intake.touchedPos, intake.sourcePos);
         return 0;
+    }
+
+    private static BlockPos outletPlacement(Level level, BlockPos targetPos, Fluid fluid) {
+        if (!level.isLoaded(targetPos)) return null;
+        if (canPlaceFluidBlockAtOutlet(level, targetPos, fluid)) return targetPos;
+
+        Set<BlockPos> visited = new HashSet<>();
+        ArrayDeque<Node> queue = new ArrayDeque<>();
+        queue.add(new Node(targetPos, 0));
+        visited.add(targetPos);
+
+        while (!queue.isEmpty()) {
+            Node node = queue.removeFirst();
+            if (node.distance > MAX_WORLD_OUTLET_SEARCH) continue;
+
+            FluidState state = level.getFluidState(node.pos);
+            if (!state.isEmpty() && sameFluidKind(state.getType(), fluid) && !state.isSource()) return node.pos;
+
+            for (Direction direction : Direction.values()) {
+                BlockPos next = node.pos.relative(direction);
+                if (!level.isLoaded(next) || !visited.add(next)) continue;
+                FluidState nextState = level.getFluidState(next);
+                if (!nextState.isEmpty() && sameFluidKind(nextState.getType(), fluid)) {
+                    queue.add(new Node(next, node.distance + 1));
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static boolean canPlaceFluidBlockAtOutlet(Level level, BlockPos pos, Fluid fluid) {
+        if (level.getBlockState(pos).isAir()) return true;
+        FluidState state = level.getFluidState(pos);
+        return !state.isEmpty() && sameFluidKind(state.getType(), fluid) && !state.isSource();
+    }
+
+    private static boolean placeFluidBlockAtOutlet(Level level, BlockPos pos, Fluid fluid) {
+        if (!canPlaceFluidBlockAtOutlet(level, pos, fluid)) return false;
+        if (fluid == Fluids.WATER || fluid == Fluids.FLOWING_WATER) return level.setBlockAndUpdate(pos, Blocks.WATER.defaultBlockState());
+        if (fluid == Fluids.LAVA || fluid == Fluids.FLOWING_LAVA) return level.setBlockAndUpdate(pos, Blocks.LAVA.defaultBlockState());
+        return false;
     }
 
     private static int drainTanksToWorld(Level level, Scan scan, List<TankContact> contacts, End target, BlockPos worldPos, int budget) {
@@ -1168,6 +1253,7 @@ public final class TankPressureService {
         }
     }
     private record WorldIntake(BlockPos touchedPos, BlockPos sourcePos, Fluid fluid, int distance, boolean touchedSource) {}
+    private record WorldOutletTarget(End end, BlockPos placePos, int searchDistance) {}
     private record HydraulicMovePlan(TankContact source, TankContact target, int amount, double sourceSurface, double sharedSurface) {}
     private record PressureRoute(End source, End target, List<Step> path, double head, double activeHead, double conductance, float pressure) {}
     private record ProcessedTick(long gameTime, Set<BlockPos> pipes) {}
