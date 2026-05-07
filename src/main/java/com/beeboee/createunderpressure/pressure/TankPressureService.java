@@ -65,21 +65,28 @@ public final class TankPressureService {
 
         Scan scan = scan(level, seed);
         if (scan == null || scan.pipes.isEmpty()) return;
-        if (!ownsPipeNetwork(scan, seed)) return;
+
+        BlockPos owner = ownerPipe(scan);
+        if (!seed.equals(owner)) return;
         if (overlaps(scan.pipes, processed.pipes)) return;
         processed.pipes.addAll(scan.pipes);
 
-        int settled = settleConnectedTanks(level, scan);
-        if (settled > 0) DebugInfo.log(level, "HYDRAULIC settle owner={} moved={}mb", seed, settled);
+        DebugInfo.beginNetwork(level, scan.pipes, owner);
+        try {
+            int settled = settleConnectedTanks(level, scan);
+            if (settled > 0) DebugInfo.log(level, "HYDRAULIC settle owner={} moved={}mb", seed, settled);
 
-        List<PressureRoute> routes = pressureRoutes(level, scan);
-        if (routes.isEmpty()) {
-            DebugInfo.log(level, "GRAPH idle owner={} endpoints={} pipes={}", seed, scan.ends.size(), scan.pipes.size());
-            return;
+            List<PressureRoute> routes = pressureRoutes(level, scan);
+            if (routes.isEmpty()) {
+                DebugInfo.log(level, "GRAPH idle owner={} endpoints={} pipes={}", seed, scan.ends.size(), scan.pipes.size());
+                return;
+            }
+
+            DebugInfo.log(level, "GRAPH settle owner={} routes={} endpoints={} pipes={}", seed, routes.size(), scan.ends.size(), scan.pipes.size());
+            for (PressureRoute route : routes) apply(level, route);
+        } finally {
+            DebugInfo.endNetwork();
         }
-
-        DebugInfo.log(level, "GRAPH settle owner={} routes={} endpoints={} pipes={}", seed, routes.size(), scan.ends.size(), scan.pipes.size());
-        for (PressureRoute route : routes) apply(level, route);
     }
 
     private static ProcessedTick processed(Level level) {
@@ -163,18 +170,18 @@ public final class TankPressureService {
             if (movedTotal >= MAX_HYDRAULIC_SETTLE_MB) break;
             if (!tankCanProvideToPipe(source.pipe, source.face, source.tank)) continue;
 
-            List<TankContact> receivers = reachableHydraulicTargets(level, scan, contacts, source);
-            if (receivers.isEmpty()) {
-                DebugInfo.log(level, "HYDRAULIC source idle tank={} pipe={} face={} surface={} cutoff={}",
-                        source.tank.getController(), source.pipe, source.face, source.head(), source.cutoffSurface());
-                continue;
-            }
-
             double sourceHead = source.head();
             int sourceCurrent = source.tank.getTankInventory().getFluidAmount();
             int sourceFloor = amountForSurface(source.tank, source.cutoffSurface());
             int sourceAvailable = sourceCurrent - sourceFloor;
-            if (sourceAvailable <= SETTLE_EPSILON_MB) continue;
+            if (sourceAvailable <= 0) continue;
+
+            List<TankContact> receivers = reachableHydraulicTargets(level, scan, contacts, source);
+            if (receivers.isEmpty()) {
+                DebugInfo.log(level, "HYDRAULIC source idle tank={} pipe={} face={} surface={} cutoff={}",
+                        source.tank.getController(), source.pipe, source.face, sourceHead, source.cutoffSurface());
+                continue;
+            }
 
             int receiverCapacity = 0;
             List<TankContact> activeReceivers = new ArrayList<>();
@@ -182,20 +189,26 @@ public final class TankPressureService {
                 int current = target.tank.getTankInventory().getFluidAmount();
                 int maxAtSourceHead = amountForSurface(target.tank, Math.min(sourceHead, target.topY()));
                 int needed = maxAtSourceHead - current;
-                if (needed > SETTLE_EPSILON_MB) {
+                if (needed > 0) {
                     activeReceivers.add(target);
                     receiverCapacity += needed;
                 }
             }
-            if (activeReceivers.isEmpty() || receiverCapacity <= SETTLE_EPSILON_MB) continue;
+            if (activeReceivers.isEmpty() || receiverCapacity <= 0) continue;
+
+            double sharedSurface = sharedSurfaceWithSource(source, activeReceivers, sourceHead);
+            double sourceStopSurface = Math.max(source.cutoffSurface(), sharedSurface);
+            int sourceAvailableToShared = sourceCurrent - amountForSurface(source.tank, sourceStopSurface);
+            if (sourceAvailableToShared <= 0) continue;
+
+            int receiverNeededToShared = receiverNeededAtSurface(activeReceivers, sharedSurface);
+            if (receiverNeededToShared <= 0) continue;
 
             int budget = Math.min(MAX_HYDRAULIC_SETTLE_MB - movedTotal, Math.min(sourceAvailable, receiverCapacity));
+            budget = Math.min(budget, sourceAvailableToShared);
+            budget = Math.min(budget, receiverNeededToShared);
             budget = Math.min(budget, curvedHydraulicBudget(sourceHead, activeReceivers));
             if (budget <= 0) continue;
-
-            int receiverCurrentTotal = 0;
-            for (TankContact target : activeReceivers) receiverCurrentTotal += target.tank.getTankInventory().getFluidAmount();
-            double sharedSurface = surfaceForAmount(activeReceivers, receiverCurrentTotal + budget, sourceHead);
 
             activeReceivers.sort((a, b) -> {
                 int surfaceCompare = Double.compare(surface(a.tank), surface(b.tank));
@@ -205,8 +218,9 @@ public final class TankPressureService {
                 return compareBlockPos(a.tank.getController(), b.tank.getController());
             });
 
-            DebugInfo.log(level, "HYDRAULIC basin plan source={} sourceSurface={} sourceCutoff={} sourceAvailable={} receivers={} budget={} sharedSurface={}",
-                    source.tank.getController(), sourceHead, source.cutoffSurface(), sourceAvailable, activeReceivers.size(), budget, sharedSurface);
+            DebugInfo.log(level, "HYDRAULIC basin plan source={} sourceSurface={} sourceCutoff={} sourceAvailable={} receivers={} budget={} sharedSurface={} receiverNeeded={} sourceToShared={}",
+                    source.tank.getController(), sourceHead, source.cutoffSurface(), sourceAvailable,
+                    activeReceivers.size(), budget, sharedSurface, receiverNeededToShared, sourceAvailableToShared);
 
             for (TankContact target : activeReceivers) {
                 if (movedTotal >= MAX_HYDRAULIC_SETTLE_MB || budget <= 0) break;
@@ -214,7 +228,7 @@ public final class TankPressureService {
                 int targetCurrent = target.tank.getTankInventory().getFluidAmount();
                 int targetAtSharedSurface = amountForSurface(target.tank, Math.min(sharedSurface, target.topY()));
                 int targetNeeded = targetAtSharedSurface - targetCurrent;
-                if (targetNeeded <= SETTLE_EPSILON_MB) continue;
+                if (targetNeeded <= 0) continue;
 
                 int move = Math.min(budget, targetNeeded);
                 int moved = moveFluid(source.tank, target.tank, move);
@@ -235,6 +249,29 @@ public final class TankPressureService {
 
         if (movedTotal > 0) DebugInfo.log(level, "HYDRAULIC basin result moved={}mb", movedTotal);
         return movedTotal;
+    }
+
+    private static double sharedSurfaceWithSource(TankContact source, List<TankContact> activeReceivers, double maxSurface) {
+        Map<BlockPos, FluidTankBlockEntity> tanks = new HashMap<>();
+        tanks.put(source.tank.getController(), source.tank);
+        for (TankContact contact : activeReceivers) tanks.putIfAbsent(contact.tank.getController(), contact.tank);
+
+        int totalAmount = 0;
+        for (FluidTankBlockEntity tank : tanks.values()) totalAmount += tank.getTankInventory().getFluidAmount();
+        return surfaceForAmount(new ArrayList<>(tanks.values()), totalAmount, maxSurface);
+    }
+
+    private static int receiverNeededAtSurface(List<TankContact> receivers, double sharedSurface) {
+        Map<BlockPos, FluidTankBlockEntity> tanks = new HashMap<>();
+        for (TankContact contact : receivers) tanks.putIfAbsent(contact.tank.getController(), contact.tank);
+
+        int needed = 0;
+        for (FluidTankBlockEntity tank : tanks.values()) {
+            int current = tank.getTankInventory().getFluidAmount();
+            int target = amountForSurface(tank, Math.min(sharedSurface, tank.getController().getY() + tank.getHeight()));
+            needed += Math.max(0, target - current);
+        }
+        return needed;
     }
 
     private static int curvedHydraulicBudget(double sourceHead, List<TankContact> activeReceivers) {
@@ -300,13 +337,13 @@ public final class TankPressureService {
         return targets;
     }
 
-    private static double surfaceForAmount(List<TankContact> contacts, int totalAmount, double maxSurface) {
+    private static double surfaceForAmount(List<FluidTankBlockEntity> tanks, int totalAmount, double maxSurface) {
         double low = Double.MAX_VALUE;
         double high = -Double.MAX_VALUE;
-        Map<BlockPos, FluidTankBlockEntity> tanks = new HashMap<>();
-        for (TankContact contact : contacts) tanks.putIfAbsent(contact.tank.getController(), contact.tank);
+        Map<BlockPos, FluidTankBlockEntity> unique = new HashMap<>();
+        for (FluidTankBlockEntity tank : tanks) unique.putIfAbsent(tank.getController(), tank);
 
-        for (FluidTankBlockEntity tank : tanks.values()) {
+        for (FluidTankBlockEntity tank : unique.values()) {
             low = Math.min(low, tank.getController().getY());
             high = Math.max(high, Math.min(maxSurface, tank.getController().getY() + tank.getHeight()));
         }
@@ -316,7 +353,7 @@ public final class TankPressureService {
         for (int i = 0; i < 40; i++) {
             double mid = (low + high) * 0.5;
             int amount = 0;
-            for (FluidTankBlockEntity tank : tanks.values()) amount += amountForSurface(tank, mid);
+            for (FluidTankBlockEntity tank : unique.values()) amount += amountForSurface(tank, mid);
             if (amount < totalAmount) low = mid;
             else high = mid;
         }
@@ -483,12 +520,12 @@ public final class TankPressureService {
         return 1.0 / (1.0 + (path.size() * PIPE_RESISTANCE_PER_STEP));
     }
 
-    private static boolean ownsPipeNetwork(Scan scan, BlockPos seed) {
+    private static BlockPos ownerPipe(Scan scan) {
         BlockPos owner = null;
         for (BlockPos pipe : scan.pipes) {
             if (owner == null || compareBlockPos(pipe, owner) < 0) owner = pipe;
         }
-        return seed.equals(owner);
+        return owner;
     }
 
     private static int compareBlockPos(BlockPos a, BlockPos b) {
