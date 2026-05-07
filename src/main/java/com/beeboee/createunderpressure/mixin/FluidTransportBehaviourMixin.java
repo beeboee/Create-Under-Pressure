@@ -14,7 +14,9 @@ public abstract class FluidTransportBehaviourMixin {
     @Inject(method = "tick", at = @At("TAIL"), remap = false)
     private void createUnderPressure$tickPipePressure(CallbackInfo ci) {
         FluidTransportBehaviour pipe = (FluidTransportBehaviour) (Object) this;
-        TankPressureService.tickPipe(pipe);
+        if (!PressureSupplementService.shouldOwnWorldOnlyNetwork(pipe)) {
+            TankPressureService.tickPipe(pipe);
+        }
         PressureSupplementService.tickPipe(pipe);
         WorldExchangeVisualLayer.tickPipe(pipe);
     }
