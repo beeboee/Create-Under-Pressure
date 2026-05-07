@@ -26,9 +26,9 @@ import net.neoforged.neoforge.fluids.FluidStack;
 public final class WorldExchangeVisualLayer {
     private WorldExchangeVisualLayer() {}
 
-    private static final int TICK_INTERVAL = 2;
+    private static final int TICK_INTERVAL = 4;
     private static final int MAX_SCAN_DISTANCE = 48;
-    private static final int MAX_PARTICLES_PER_END = 4;
+    private static final int MAX_PARTICLES_PER_END = 2;
 
     public static void tickPipe(FluidTransportBehaviour pipe) {
         Level level = pipe.getWorld();
@@ -110,36 +110,37 @@ public final class WorldExchangeVisualLayer {
     private static void spawnIntakeParticles(Level level, OpenEnd end, FluidState fluidState, double strength) {
         boolean underwater = !fluidState.isEmpty();
         ParticleOptions particle = underwater ? ParticleTypes.BUBBLE : ParticleTypes.SPLASH;
-        spawnDirectionalParticles(level, end, particle, 1.0, underwater, strength);
+        spawnDirectionalParticles(level, end, particle, true, underwater, strength);
     }
 
     private static void spawnOutputParticles(Level level, OpenEnd end, boolean underwater, double strength) {
         ParticleOptions particle = underwater ? ParticleTypes.BUBBLE : ParticleTypes.SPLASH;
-        spawnDirectionalParticles(level, end, particle, -1.0, underwater, strength);
+        spawnDirectionalParticles(level, end, particle, false, underwater, strength);
     }
 
-    private static void spawnDirectionalParticles(Level level, OpenEnd end, ParticleOptions particle, double directionMultiplier,
+    private static void spawnDirectionalParticles(Level level, OpenEnd end, ParticleOptions particle, boolean intake,
                                                   boolean underwater, double strength) {
         RandomSource random = level.random;
         Direction face = end.face;
-        BlockPos pipePos = end.pipe;
-        BlockPos outPos = pipePos.relative(face);
+        BlockPos outPos = end.pipe.relative(face);
 
-        double baseX = outPos.getX() + 0.5 - (face.getStepX() * 0.42);
-        double baseY = outPos.getY() + 0.5 - (face.getStepY() * 0.42);
-        double baseZ = outPos.getZ() + 0.5 - (face.getStepZ() * 0.42);
+        double baseOffset = intake && underwater ? 0.25 : -0.42;
+        double baseX = outPos.getX() + 0.5 + (face.getStepX() * baseOffset);
+        double baseY = outPos.getY() + 0.5 + (face.getStepY() * baseOffset);
+        double baseZ = outPos.getZ() + 0.5 + (face.getStepZ() * baseOffset);
 
-        double speed = 0.035 + (0.12 * strength);
-        int count = 1 + Math.min(MAX_PARTICLES_PER_END - 1, (int) Math.round(strength * (MAX_PARTICLES_PER_END - 1)));
+        double directionMultiplier = intake ? -1.0 : 1.0;
+        double speed = 0.025 + (0.095 * strength);
+        int count = 1 + Math.min(MAX_PARTICLES_PER_END - 1, (int) Math.floor(strength * MAX_PARTICLES_PER_END));
 
         for (int i = 0; i < count; i++) {
-            double jitterX = (random.nextDouble() - 0.5) * 0.16;
-            double jitterY = (random.nextDouble() - 0.5) * 0.16;
-            double jitterZ = (random.nextDouble() - 0.5) * 0.16;
+            double jitterX = (random.nextDouble() - 0.5) * 0.14;
+            double jitterY = (random.nextDouble() - 0.5) * 0.14;
+            double jitterZ = (random.nextDouble() - 0.5) * 0.14;
 
-            double vx = (face.getStepX() * speed * directionMultiplier) + (jitterX * 0.12);
-            double vy = (face.getStepY() * speed * directionMultiplier) + (underwater ? 0.035 + (0.08 * strength) : 0.015) + (jitterY * 0.12);
-            double vz = (face.getStepZ() * speed * directionMultiplier) + (jitterZ * 0.12);
+            double vx = (face.getStepX() * speed * directionMultiplier) + (jitterX * 0.08);
+            double vy = (face.getStepY() * speed * directionMultiplier) + (underwater ? (intake ? 0.015 : 0.045 + (0.065 * strength)) : 0.012) + (jitterY * 0.08);
+            double vz = (face.getStepZ() * speed * directionMultiplier) + (jitterZ * 0.08);
 
             level.addParticle(particle, baseX + jitterX, baseY + jitterY, baseZ + jitterZ, vx, vy, vz);
         }
