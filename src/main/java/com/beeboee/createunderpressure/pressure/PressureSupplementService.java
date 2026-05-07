@@ -290,9 +290,9 @@ public final class PressureSupplementService {
             for (OpenEnd targetEnd : scan.openEnds) {
                 if (targetEnd.equals(sourceEnd)) continue;
 
-                int maxOutputY = Math.max(sourcePos.getY(), targetEnd.worldPos().getY());
-                if (targetEnd.worldPos().getY() > maxOutputY) {
-                    DebugInfo.log(level, "SUPPLEMENT world transfer candidate rejected outlet={} reason=aboveOutletFillCap source={} sourceY={} outletY={} capY={}",
+                int maxOutputY = targetEnd.worldPos().getY();
+                if (targetEnd.worldPos().getY() > sourcePos.getY()) {
+                    DebugInfo.log(level, "SUPPLEMENT world transfer candidate rejected outlet={} reason=wouldPushUp source={} sourceY={} outletY={} capY={}",
                             targetEnd.worldPos(), sourcePos, sourcePos.getY(), targetEnd.worldPos().getY(), maxOutputY);
                     continue;
                 }
@@ -320,12 +320,12 @@ public final class PressureSupplementService {
                 markRecentlyMovedSource(level, sourcePos);
                 markRecentlyMovedSource(level, target.placePos);
                 DebugInfo.log(level,
-                        "SUPPLEMENT world transfer source={} target={} outlet={} fluid={} sourceHead={} searchDistance={} flowingTarget={} capY={} rule=flowingFirstFillToOutletEndNoSameBody",
+                        "SUPPLEMENT world transfer source={} target={} outlet={} fluid={} sourceHead={} searchDistance={} flowingTarget={} capY={} rule=flowingFirstFillToOutletEndNoUpNoSameBody",
                         sourcePos, target.placePos, target.end.worldPos(), fluid, sourceHead, target.searchDistance, target.flowing, target.maxOutputY);
                 return WORLD_BLOCK_MB;
             }
 
-            DebugInfo.log(level, "SUPPLEMENT world transfer idle source={} reason=noSeparateOutletWithinOutletFillCap", sourcePos);
+            DebugInfo.log(level, "SUPPLEMENT world transfer idle source={} reason=noSeparateOutletWithinOutletCap", sourcePos);
         }
 
         return 0;
