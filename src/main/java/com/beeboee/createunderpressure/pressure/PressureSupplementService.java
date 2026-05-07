@@ -86,6 +86,9 @@ public final class PressureSupplementService {
             int moved = settleThroughTankBridges(level, scan);
             if (moved > 0) DebugInfo.log(level, "SUPPLEMENT tank bridge moved={}mb", moved);
 
+            int drained = drainTanksToWorldWithPropagatedHead(level, scan);
+            if (drained > 0) DebugInfo.log(level, "SUPPLEMENT world drain moved={}mb", drained);
+
             int transferred = transferWorldToWorldFallback(level, scan);
             if (transferred > 0) DebugInfo.log(level, "SUPPLEMENT world transfer moved={}mb", transferred);
         } finally {
@@ -189,6 +192,84 @@ public final class PressureSupplementService {
         }
 
         return 0;
+    }
+
+    private static int drainTanksToWorldWithPropagatedHead(Level level, Scan scan) {
+        if (scan.contacts.isEmpty() || scan.openEnds.isEmpty()) return 0;
+
+        for (OpenEnd outlet : scan.openEnds) {
+            BlockPos worldPos = outlet.worldPos();
+            if (!level.isLoaded(worldPos) || !level.getBlockState(worldPos).isAir()) continue;
+
+            double targetHead = worldPos.getY();
+            TankContact source = bestPropagatedHeadSource(level, scan, outlet, targetHead);
+            if (source == null) {
+                DebugInfo.log(level, "SUPPLEMENT world drain idle outlet={} reason=noPropagatedHeadSource targetHead={}", worldPos, targetHead);
+                continue;
+            }
+
+            double sourceHead = surface(source.tank);
+            FluidStack fluid = source.tank.getTankInventory().getFluid();
+            if (fluid.isEmpty() || !canPlaceFluidBlock(fluid.getFluid())) continue;
+
+            int sourceFloor = amountForSurface(source.tank, source.cutoffSurface());
+            int available = source.tank.getTankInventory().getFluidAmount() - sourceFloor;
+            if (available < WORLD_BLOCK_MB) {
+                DebugInfo.log(level, "SUPPLEMENT world drain skip source={} outlet={} reason=availableBelow1000 available={}", source.tank.getController(), worldPos, available);
+                continue;
+            }
+
+            FluidStack simulated = source.tank.getTankInventory().drain(WORLD_BLOCK_MB, FluidAction.SIMULATE);
+            if (simulated.isEmpty() || simulated.getAmount() < WORLD_BLOCK_MB) continue;
+            if (!placeFluidBlockAtOutlet(level, worldPos, simulated.getFluid())) continue;
+
+            FluidStack drained = source.tank.getTankInventory().drain(WORLD_BLOCK_MB, FluidAction.EXECUTE);
+            if (drained.isEmpty()) {
+                level.setBlockAndUpdate(worldPos, Blocks.AIR.defaultBlockState());
+                continue;
+            }
+
+            DebugInfo.log(level,
+                    "SUPPLEMENT world drain propagatedHead source={} sourcePipe={} outlet={} outletPipe={} moved={} sourceSurface={} targetHead={} rule=fillInlineTanksFirst",
+                    source.tank.getController(), source.pipe, worldPos, outlet.pipe, drained.getAmount(), sourceHead, targetHead);
+            return drained.getAmount();
+        }
+
+        return 0;
+    }
+
+    private static TankContact bestPropagatedHeadSource(Level level, Scan scan, OpenEnd outlet, double targetHead) {
+        return scan.contacts.stream()
+                .filter(PressureSupplementService::canProvide)
+                .filter(contact -> surface(contact.tank) > targetHead + DEAD_BAND)
+                .filter(contact -> canReachWithinPropagatedHead(level, scan, contact.pipe, outlet.pipe, surface(contact.tank)))
+                .max(Comparator
+                        .comparingDouble((TankContact contact) -> surface(contact.tank))
+                        .thenComparing(contact -> -contact.pipe.distManhattan(outlet.pipe)))
+                .orElse(null);
+    }
+
+    private static boolean canReachWithinPropagatedHead(Level level, Scan scan, BlockPos sourcePipe, BlockPos outletPipe, double maxHead) {
+        Set<BlockPos> visited = new HashSet<>();
+        ArrayDeque<BlockPos> queue = new ArrayDeque<>();
+        queue.add(sourcePipe);
+        visited.add(sourcePipe);
+
+        while (!queue.isEmpty()) {
+            BlockPos current = queue.removeFirst();
+            if (current.equals(outletPipe)) return true;
+
+            FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, current);
+            if (pipe == null) continue;
+
+            for (Direction face : FluidPropagator.getPipeConnections(level.getBlockState(current), pipe)) {
+                BlockPos next = current.relative(face);
+                if (!scan.pipes.contains(next) || next.getY() > maxHead + EPSILON || !visited.add(next)) continue;
+                queue.add(next);
+            }
+        }
+
+        return false;
     }
 
     private static int transferWorldToWorldFallback(Level level, Scan scan) {
@@ -372,6 +453,10 @@ public final class PressureSupplementService {
         return !state.isEmpty() && sameFluidKind(state.getType(), fluid) && !state.isSource();
     }
 
+    private static boolean canPlaceFluidBlock(Fluid fluid) {
+        return isWater(fluid) || isLavaFluid(fluid);
+    }
+
     private static boolean placeFluidBlockAtOutlet(Level level, BlockPos pos, Fluid fluid) {
         if (!canPlaceAtOutlet(level, pos, fluid, pos.getY())) return false;
         if (isWater(fluid)) return level.setBlockAndUpdate(pos, Blocks.WATER.defaultBlockState());
@@ -435,10 +520,6 @@ public final class PressureSupplementService {
         FluidStack sourceFluid = source.getTankInventory().getFluid();
         FluidStack targetFluid = target.getTankInventory().getFluid();
         return sourceFluid.isEmpty() || targetFluid.isEmpty() || FluidStack.isSameFluidSameComponents(sourceFluid, targetFluid);
-    }
-
-    private static boolean sameTank(FluidTankBlockEntity a, FluidTankBlockEntity b) {
-        return a.getController().equals(b.getController());
     }
 
     private static double surface(FluidTankBlockEntity tank) {
