@@ -10,6 +10,7 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.component.DataComponents;
@@ -36,6 +37,10 @@ public final class DebugInfo {
     private static Path activeLogFile = null;
     private static boolean endedMessageSent = true;
     private static BlockPos selectedTarget = null;
+
+    private static boolean networkContextActive = false;
+    private static boolean networkContextAllowed = true;
+    private static String networkContextTag = null;
 
     public static void rememberChat(Player player, String message) {
         if (player == null || message == null || message.isBlank()) return;
@@ -75,7 +80,7 @@ public final class DebugInfo {
         if (!extending || activeLogFile == null) activeLogFile = newLogFile(player);
 
         long remainingSeconds = Math.max(0, (debugUntilGameTime - now + 19L) / 20L);
-        String scope = selectedTarget == null ? "global" : "target " + selectedTarget.toShortString();
+        String scope = selectedTarget == null ? "global" : "network containing " + selectedTarget.toShortString();
         Component message = Component.literal(extending
             ? "Create: Under Pressure debug logging extended by " + seconds + " seconds (" + remainingSeconds + "s remaining, " + scope + ")"
             : "Create: Under Pressure debug logging enabled for " + seconds + " seconds (" + scope + ")");
@@ -102,28 +107,56 @@ public final class DebugInfo {
         activeStack = ItemStack.EMPTY;
         activeLogFile = null;
         selectedTarget = null;
+        clearNetworkContext();
     }
 
     public static boolean isEnabled(Level level) {
         return level != null && level.getGameTime() <= debugUntilGameTime;
     }
 
+    public static boolean beginNetwork(Level level, Set<BlockPos> networkPipes, BlockPos owner) {
+        networkContextActive = true;
+        networkContextTag = owner == null ? "net@unknown" : "net@" + owner.toShortString();
+        networkContextAllowed = isEnabled(level) && (selectedTarget == null || touchesSelectedTarget(networkPipes));
+        return networkContextAllowed;
+    }
+
+    public static void endNetwork() {
+        clearNetworkContext();
+    }
+
+    public static boolean isNetworkAllowed() {
+        return !networkContextActive || networkContextAllowed;
+    }
+
     public static void log(Level level, String message, Object... args) {
         if (!isEnabled(level)) return;
+        if (!isNetworkAllowed()) return;
 
         String formatted = format(message, args);
-        if (!passesTargetFilter(formatted)) return;
+        if (!networkContextActive && !passesLooseTargetFilter(formatted)) return;
+        if (networkContextActive && networkContextTag != null) formatted = "[" + networkContextTag + "] " + formatted;
 
-        CreateUnderPressure.LOGGER.info(message, args);
+        CreateUnderPressure.LOGGER.info("{}", formatted);
         writeLine(formatted);
     }
 
-    private static boolean passesTargetFilter(String line) {
+    private static boolean touchesSelectedTarget(Set<BlockPos> networkPipes) {
+        return selectedTarget == null || networkPipes.contains(selectedTarget);
+    }
+
+    private static boolean passesLooseTargetFilter(String line) {
         if (selectedTarget == null) return true;
 
         String shortPos = selectedTarget.toShortString();
         String longPos = selectedTarget.toString();
         return line.contains(shortPos) || line.contains(longPos);
+    }
+
+    private static void clearNetworkContext() {
+        networkContextActive = false;
+        networkContextAllowed = true;
+        networkContextTag = null;
     }
 
     private static void disable(Level level, Player player, String text) {
@@ -140,6 +173,7 @@ public final class DebugInfo {
         activeStack = ItemStack.EMPTY;
         activeLogFile = null;
         selectedTarget = null;
+        clearNetworkContext();
     }
 
     private static void setGlint(ItemStack stack, boolean enabled) {
