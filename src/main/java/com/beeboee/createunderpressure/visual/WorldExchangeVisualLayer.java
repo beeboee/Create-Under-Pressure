@@ -29,6 +29,7 @@ public final class WorldExchangeVisualLayer {
     private static final int TICK_INTERVAL = 4;
     private static final int MAX_SCAN_DISTANCE = 48;
     private static final int MAX_PARTICLES_PER_END = 2;
+    private static final double EPSILON = 0.01;
 
     public static void tickPipe(FluidTransportBehaviour pipe) {
         Level level = pipe.getWorld();
@@ -46,7 +47,7 @@ public final class WorldExchangeVisualLayer {
             FluidState worldFluid = level.getFluidState(worldPos);
             if (!worldFluid.isEmpty()) {
                 spawnIntakeParticles(level, end, worldFluid, scan.strength());
-            } else if (level.getBlockState(worldPos).isAir() && scan.hasFluidSupply()) {
+            } else if (level.getBlockState(worldPos).isAir() && scan.canOutputFromPipe(end.pipe)) {
                 spawnOutputParticles(level, end, false, scan.strength());
             }
         }
@@ -57,7 +58,7 @@ public final class WorldExchangeVisualLayer {
         Set<BlockPos> visited = new HashSet<>();
         ArrayDeque<Node> queue = new ArrayDeque<>();
         Set<OpenEnd> openEnds = new HashSet<>();
-        boolean hasFluidSupply = false;
+        Set<BlockPos> tankOutputPipes = new HashSet<>();
         int supplyScore = 0;
 
         queue.add(new Node(seed, 0));
@@ -86,8 +87,8 @@ public final class WorldExchangeVisualLayer {
                 FluidTankBlockEntity tank = tankAt(level, other);
                 if (tank != null) {
                     FluidStack stack = tank.getTankInventory().getFluid();
-                    if (!stack.isEmpty()) {
-                        hasFluidSupply = true;
+                    if (!stack.isEmpty() && tankCanProvideToPipe(node.pos, face, tank)) {
+                        tankOutputPipes.add(node.pos);
                         supplyScore = Math.max(supplyScore, Math.min(1000, stack.getAmount() / 4));
                     }
                     continue;
@@ -96,15 +97,12 @@ public final class WorldExchangeVisualLayer {
                 if (FluidPropagator.isOpenEnd(level, node.pos, face)) {
                     openEnds.add(new OpenEnd(node.pos, face));
                     FluidState fluidState = level.getFluidState(other);
-                    if (!fluidState.isEmpty()) {
-                        hasFluidSupply = true;
-                        supplyScore = Math.max(supplyScore, fluidState.isSource() ? 1000 : 450);
-                    }
+                    if (!fluidState.isEmpty()) supplyScore = Math.max(supplyScore, fluidState.isSource() ? 1000 : 450);
                 }
             }
         }
 
-        return new VisualScan(pipes, openEnds, hasFluidSupply, supplyScore);
+        return new VisualScan(pipes, openEnds, tankOutputPipes, supplyScore);
     }
 
     private static void spawnIntakeParticles(Level level, OpenEnd end, FluidState fluidState, double strength) {
@@ -146,6 +144,40 @@ public final class WorldExchangeVisualLayer {
         }
     }
 
+    private static boolean tankCanProvideToPipe(BlockPos pipe, Direction face, FluidTankBlockEntity tank) {
+        int amount = tank.getTankInventory().getFluidAmount();
+        if (amount <= 0) return false;
+        double cutoff = sourceCutoffSurface(pipe, face, tank);
+        return surface(tank, amount) > cutoff + EPSILON && amount > amountForSurface(tank, cutoff);
+    }
+
+    private static double sourceCutoffSurface(BlockPos pipe, Direction face, FluidTankBlockEntity tank) {
+        BlockPos tankBlock = pipe.relative(face);
+        double bottom = tank.getController().getY();
+        double top = bottom + tank.getHeight();
+        double cutoff = switch (face) {
+            case UP -> tankBlock.getY();
+            case DOWN -> tankBlock.getY() + 1.0;
+            default -> tankBlock.getY();
+        };
+        return Math.max(bottom, Math.min(top, cutoff));
+    }
+
+    private static double surface(FluidTankBlockEntity tank, int amount) {
+        if (amount <= 0) return tank.getController().getY();
+        return tank.getController().getY() + (amount / layerCapacity(tank));
+    }
+
+    private static int amountForSurface(FluidTankBlockEntity tank, double surfaceY) {
+        int capacity = tank.getTankInventory().getCapacity();
+        double filledHeight = Math.max(0.0, Math.min(tank.getHeight(), surfaceY - tank.getController().getY()));
+        return Math.max(0, Math.min(capacity, (int) Math.round(filledHeight * layerCapacity(tank))));
+    }
+
+    private static double layerCapacity(FluidTankBlockEntity tank) {
+        return (double) tank.getTankInventory().getCapacity() / (double) Math.max(1, tank.getHeight());
+    }
+
     private static FluidTankBlockEntity tankAt(Level level, BlockPos pos) {
         if (!(level.getBlockEntity(pos) instanceof FluidTankBlockEntity tank)) return null;
         FluidTankBlockEntity controller = tank.isController() ? tank : tank.getControllerBE();
@@ -154,7 +186,11 @@ public final class WorldExchangeVisualLayer {
 
     private record Node(BlockPos pos, int distance) {}
     private record OpenEnd(BlockPos pipe, Direction face) {}
-    private record VisualScan(Set<BlockPos> pipes, Set<OpenEnd> openEnds, boolean hasFluidSupply, int supplyScore) {
+    private record VisualScan(Set<BlockPos> pipes, Set<OpenEnd> openEnds, Set<BlockPos> tankOutputPipes, int supplyScore) {
+        boolean canOutputFromPipe(BlockPos pipe) {
+            return tankOutputPipes.contains(pipe);
+        }
+
         public double strength() {
             return Math.max(0.15, Math.min(1.0, supplyScore / 1000.0));
         }
