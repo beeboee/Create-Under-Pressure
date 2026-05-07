@@ -148,7 +148,7 @@ public final class TankPressureService {
     }
 
     private static int settleConnectedTanks(Level level, Scan scan) {
-        List<FluidTankBlockEntity> tanks = uniqueTanks(scan);
+        List<FluidTankBlockEntity> tanks = uniqueTanks(level, scan);
         if (tanks.size() < 2) return 0;
         if (!singleFluidGroup(tanks)) return 0;
 
@@ -164,15 +164,23 @@ public final class TankPressureService {
         List<TankDelta> sources = new ArrayList<>();
         List<TankDelta> targets = new ArrayList<>();
 
+        DebugInfo.log(level, "HYDRAULIC plan targetSurface={} total={} capacity={} tanks={} pipes={}", targetSurface, total, totalCapacity, tanks.size(), scan.pipes.size());
         for (FluidTankBlockEntity tank : tanks) {
             int current = tank.getTankInventory().getFluidAmount();
             int target = amountForSurface(tank, targetSurface);
             int delta = current - target;
+            double currentSurface = surface(tank);
+            DebugInfo.log(level, "HYDRAULIC tank pos={} bottomY={} height={} current={} target={} delta={} surface={} targetSurface={}",
+                    tank.getController(), tank.getController().getY(), tank.getHeight(), current, target, delta, currentSurface, targetSurface);
             if (delta > SETTLE_EPSILON_MB) sources.add(new TankDelta(tank, delta));
             if (delta < -SETTLE_EPSILON_MB) targets.add(new TankDelta(tank, -delta));
         }
 
-        if (sources.isEmpty() || targets.isEmpty()) return 0;
+        if (sources.isEmpty() || targets.isEmpty()) {
+            DebugInfo.log(level, "HYDRAULIC stable targetSurface={} sources={} targets={}", targetSurface, sources.size(), targets.size());
+            return 0;
+        }
+
         sources.sort((a, b) -> Double.compare(surface(b.tank) - targetSurface, surface(a.tank) - targetSurface));
         targets.sort((a, b) -> Double.compare(targetSurface - surface(b.tank), targetSurface - surface(a.tank)));
 
@@ -188,33 +196,56 @@ public final class TankPressureService {
                 }
 
                 int move = Math.min(MAX_HYDRAULIC_SETTLE_MB - movedTotal, Math.min(source.amount, needed));
-                if (move <= 0) return movedTotal;
+                if (move <= 0) {
+                    logHydraulicResult(level, targetSurface, tanks.size(), movedTotal, "cap-or-empty");
+                    return movedTotal;
+                }
 
                 int moved = moveFluid(source.tank, target.tank, move);
                 if (moved <= 0) {
+                    DebugInfo.log(level, "HYDRAULIC move failed source={} target={} requested={} sourceRemaining={} targetNeeded={}",
+                            source.tank.getController(), target.tank.getController(), move, source.amount, needed);
                     sourceIndex++;
                     continue;
                 }
 
+                DebugInfo.log(level, "HYDRAULIC move source={} target={} moved={} requested={} sourceRemainingBefore={} targetNeededBefore={}",
+                        source.tank.getController(), target.tank.getController(), moved, move, source.amount, needed);
                 movedTotal += moved;
                 source.amount -= moved;
                 needed -= moved;
 
-                if (movedTotal >= MAX_HYDRAULIC_SETTLE_MB) return movedTotal;
+                if (movedTotal >= MAX_HYDRAULIC_SETTLE_MB) {
+                    logHydraulicResult(level, targetSurface, tanks.size(), movedTotal, "cap");
+                    return movedTotal;
+                }
             }
         }
 
-        if (movedTotal > 0) {
-            DebugInfo.log(level, "HYDRAULIC targetSurface={} tanks={} moved={}mb", targetSurface, tanks.size(), movedTotal);
-        }
+        logHydraulicResult(level, targetSurface, tanks.size(), movedTotal, "complete");
         return movedTotal;
     }
 
-    private static List<FluidTankBlockEntity> uniqueTanks(Scan scan) {
+    private static void logHydraulicResult(Level level, double targetSurface, int tanks, int movedTotal, String reason) {
+        if (movedTotal > 0) {
+            DebugInfo.log(level, "HYDRAULIC result targetSurface={} tanks={} moved={}mb reason={}", targetSurface, tanks, movedTotal, reason);
+        }
+    }
+
+    private static List<FluidTankBlockEntity> uniqueTanks(Level level, Scan scan) {
         Map<BlockPos, FluidTankBlockEntity> tanks = new HashMap<>();
+
+        for (BlockPos pipePos : scan.pipes) {
+            for (Direction direction : Direction.values()) {
+                FluidTankBlockEntity tank = tankAt(level, pipePos.relative(direction));
+                if (tank != null) tanks.putIfAbsent(tank.getController(), tank);
+            }
+        }
+
         for (End end : scan.ends) {
             if (end.tank != null) tanks.putIfAbsent(end.tank.getController(), end.tank);
         }
+
         return new ArrayList<>(tanks.values());
     }
 
