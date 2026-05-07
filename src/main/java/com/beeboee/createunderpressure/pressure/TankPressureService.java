@@ -29,6 +29,7 @@ public final class TankPressureService {
     private static final int MAX_ROUTES = 32;
     private static final int MAX_HYDRAULIC_SETTLE_MB = 250;
     private static final int SETTLE_EPSILON_MB = 25;
+    private static final double HYDRAULIC_SETTLE_DEADBAND = 0.03;
 
     private static final float LAVA_PRESSURE_MULTIPLIER = 0.35f;
     private static final float TRICKLE_PRESSURE = 8.0f;
@@ -311,7 +312,7 @@ public final class TankPressureService {
         if (!compatible(source.tank, target.tank)) return false;
         if (target.tank.getTankInventory().getFluidAmount() >= target.tank.getTankInventory().getCapacity()) return false;
         if (target.cutoffSurface() > source.head() + EPSILON) return false;
-        return surface(target.tank) < source.head() - EPSILON;
+        return surface(target.tank) < source.head() - HYDRAULIC_SETTLE_DEADBAND;
     }
 
     private static Map<BlockPos, List<TankContact>> contactsByPipe(List<TankContact> contacts) {
