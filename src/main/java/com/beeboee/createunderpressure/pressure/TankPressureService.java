@@ -28,10 +28,12 @@ public final class TankPressureService {
     private static final int MAX_ROUTES = 32;
 
     private static final float LAVA_PRESSURE_MULTIPLIER = 0.35f;
-    private static final float TANK_TO_TANK_PRESSURE_MULTIPLIER = 0.12f;
-    private static final float TANK_TO_TANK_MAX_PRESSURE = 1.25f;
     private static final float TRICKLE_PRESSURE = 8.0f;
     private static final float MAX_PRESSURE = 256.0f;
+
+    private static final float TANK_SETTLE_MAX_PRESSURE = 0.55f;
+    private static final double TANK_SETTLE_DEADBAND = 0.35;
+    private static final double TANK_SETTLE_FULL_HEAD = 4.0;
 
     private static final double DEAD_HEAD = 0.125;
     private static final double TANK_SETTLE_HEAD = 0.0;
@@ -182,13 +184,22 @@ public final class TankPressureService {
     }
 
     private static float routePressure(End source, End target, double activeHead, double conductance) {
-        float pressure = pressureForHead(activeHead) * (float) conductance * pressureMultiplier(source, target);
-        if (tankToTank(source, target)) pressure = Math.min(pressure, TANK_TO_TANK_MAX_PRESSURE);
-        return pressure;
+        if (tankToTank(source, target)) return tankSettlePressure(source, activeHead, conductance);
+        return pressureForHead(activeHead) * (float) conductance * pressureMultiplier(source);
+    }
+
+    private static float tankSettlePressure(End source, double activeHead, double conductance) {
+        if (activeHead <= TANK_SETTLE_DEADBAND) return 0.0f;
+
+        double t = (activeHead - TANK_SETTLE_DEADBAND) / (TANK_SETTLE_FULL_HEAD - TANK_SETTLE_DEADBAND);
+        t = Math.max(0.0, Math.min(1.0, t));
+        double eased = t * t * (3.0 - (2.0 * t));
+
+        return (float) (TANK_SETTLE_MAX_PRESSURE * eased * conductance * pressureMultiplier(source));
     }
 
     private static double routeScore(PressureRoute route) {
-        return route.pressure - (route.path.size() * 0.001);
+        return route.activeHead + (route.pressure * 0.01) - (route.path.size() * 0.001);
     }
 
     private static boolean canReceiveFrom(End source, End target) {
@@ -334,10 +345,8 @@ public final class TankPressureService {
         for (BlockPos pipePos : graph.keySet()) FluidTransportBehaviour.cacheFlows(level, pipePos);
     }
 
-    private static float pressureMultiplier(End source, End target) {
-        float multiplier = fluidPressureMultiplier(source);
-        if (tankToTank(source, target)) multiplier *= TANK_TO_TANK_PRESSURE_MULTIPLIER;
-        return multiplier;
+    private static float pressureMultiplier(End source) {
+        return fluidPressureMultiplier(source);
     }
 
     private static float fluidPressureMultiplier(End source) {
