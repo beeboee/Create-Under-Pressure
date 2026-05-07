@@ -11,6 +11,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
@@ -34,6 +35,7 @@ public final class DebugInfo {
     private static ItemStack activeStack = ItemStack.EMPTY;
     private static Path activeLogFile = null;
     private static boolean endedMessageSent = true;
+    private static BlockPos selectedTarget = null;
 
     public static void rememberChat(Player player, String message) {
         if (player == null || message == null || message.isBlank()) return;
@@ -41,15 +43,23 @@ public final class DebugInfo {
     }
 
     public static void toggle(Level level, Player player, ItemStack stack, boolean stop) {
+        toggle(level, player, stack, stop, null);
+    }
+
+    public static void toggle(Level level, Player player, ItemStack stack, boolean stop, BlockPos target) {
         if (stop && isEnabled(level)) {
             disable(level, player, "Create: Under Pressure debug logging stopped");
             return;
         }
 
-        enable(level, player, stack, DEFAULT_SECONDS);
+        enable(level, player, stack, DEFAULT_SECONDS, target);
     }
 
     public static void enable(Level level, Player player, ItemStack stack, int seconds) {
+        enable(level, player, stack, seconds, null);
+    }
+
+    public static void enable(Level level, Player player, ItemStack stack, int seconds, BlockPos target) {
         long now = level.getGameTime();
         boolean extending = isEnabled(level);
 
@@ -59,14 +69,16 @@ public final class DebugInfo {
         activePlayerId = player.getUUID();
         activeStack = stack;
         endedMessageSent = false;
+        selectedTarget = target == null ? null : target.immutable();
         setGlint(stack, true);
 
         if (!extending || activeLogFile == null) activeLogFile = newLogFile(player);
 
         long remainingSeconds = Math.max(0, (debugUntilGameTime - now + 19L) / 20L);
+        String scope = selectedTarget == null ? "global" : "target " + selectedTarget.toShortString();
         Component message = Component.literal(extending
-            ? "Create: Under Pressure debug logging extended by " + seconds + " seconds (" + remainingSeconds + "s remaining)"
-            : "Create: Under Pressure debug logging enabled for " + seconds + " seconds");
+            ? "Create: Under Pressure debug logging extended by " + seconds + " seconds (" + remainingSeconds + "s remaining, " + scope + ")"
+            : "Create: Under Pressure debug logging enabled for " + seconds + " seconds (" + scope + ")");
 
         player.displayClientMessage(message, true);
         writeLine("SESSION " + message.getString());
@@ -89,6 +101,7 @@ public final class DebugInfo {
         activePlayerId = null;
         activeStack = ItemStack.EMPTY;
         activeLogFile = null;
+        selectedTarget = null;
     }
 
     public static boolean isEnabled(Level level) {
@@ -98,8 +111,19 @@ public final class DebugInfo {
     public static void log(Level level, String message, Object... args) {
         if (!isEnabled(level)) return;
 
+        String formatted = format(message, args);
+        if (!passesTargetFilter(formatted)) return;
+
         CreateUnderPressure.LOGGER.info(message, args);
-        writeLine(format(message, args));
+        writeLine(formatted);
+    }
+
+    private static boolean passesTargetFilter(String line) {
+        if (selectedTarget == null) return true;
+
+        String shortPos = selectedTarget.toShortString();
+        String longPos = selectedTarget.toString();
+        return line.contains(shortPos) || line.contains(longPos);
     }
 
     private static void disable(Level level, Player player, String text) {
@@ -115,6 +139,7 @@ public final class DebugInfo {
         activePlayerId = null;
         activeStack = ItemStack.EMPTY;
         activeLogFile = null;
+        selectedTarget = null;
     }
 
     private static void setGlint(ItemStack stack, boolean enabled) {
