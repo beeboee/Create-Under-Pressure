@@ -563,9 +563,13 @@ public final class TankPressureService {
     private record Scan(Set<BlockPos> pipes, List<End> ends) {}
     private record Node(BlockPos pos, int distance) {}
     private record Step(BlockPos from, Direction fromFace, BlockPos to, Direction toFace) {}
-    private record TankDelta(FluidTankBlockEntity tank, int amount) {
-        private TankDelta withAmount(int amount) {
-            return new TankDelta(tank, amount);
+    private static final class TankDelta {
+        final FluidTankBlockEntity tank;
+        int amount;
+
+        TankDelta(FluidTankBlockEntity tank, int amount) {
+            this.tank = tank;
+            this.amount = amount;
         }
     }
     private record PressureRoute(End source, End target, List<Step> path, double head, double activeHead, double conductance, float pressure) {}
