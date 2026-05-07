@@ -522,6 +522,10 @@ public final class PressureSupplementService {
         return sourceFluid.isEmpty() || targetFluid.isEmpty() || FluidStack.isSameFluidSameComponents(sourceFluid, targetFluid);
     }
 
+    private static boolean sameTank(FluidTankBlockEntity a, FluidTankBlockEntity b) {
+        return a.getController().equals(b.getController());
+    }
+
     private static double surface(FluidTankBlockEntity tank) {
         return surface(tank, tank.getTankInventory().getFluidAmount());
     }
