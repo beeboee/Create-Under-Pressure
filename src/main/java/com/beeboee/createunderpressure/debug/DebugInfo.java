@@ -22,6 +22,8 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.FluidState;
 
 public final class DebugInfo {
     private DebugInfo() {}
@@ -30,6 +32,7 @@ public final class DebugInfo {
     private static final int MAX_FILENAME_LABEL_LENGTH = 64;
     private static final int LOOSE_TARGET_RADIUS = 8;
     private static final Pattern BLOCK_POS_PATTERN = Pattern.compile("BlockPos\\{x=(-?\\d+), y=(-?\\d+), z=(-?\\d+)\\}");
+    private static final Pattern OPEN_EXTERNAL_PATTERN = Pattern.compile("external@BlockPos\\{x=(-?\\d+), y=(-?\\d+), z=(-?\\d+)\\}[^ ]*/open=true");
     private static final DateTimeFormatter FILE_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss");
     private static final DateTimeFormatter LINE_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
@@ -139,10 +142,44 @@ public final class DebugInfo {
 
         String formatted = format(message, args);
         if (!networkContextActive && !passesLooseTargetFilter(formatted)) return;
+        formatted = enrichOpenExternalEnds(level, formatted);
         if (networkContextActive && networkContextTag != null) formatted = "[" + networkContextTag + "] " + formatted;
 
         CreateUnderPressure.LOGGER.info("{}", formatted);
         writeLine(formatted);
+    }
+
+    private static String enrichOpenExternalEnds(Level level, String line) {
+        if (level == null || !line.contains("external@") || !line.contains("/open=true")) return line;
+
+        Matcher matcher = OPEN_EXTERNAL_PATTERN.matcher(line);
+        StringBuilder details = new StringBuilder();
+        int index = 0;
+        while (matcher.find()) {
+            BlockPos pos = new BlockPos(
+                Integer.parseInt(matcher.group(1)),
+                Integer.parseInt(matcher.group(2)),
+                Integer.parseInt(matcher.group(3))
+            );
+            if (!level.isLoaded(pos)) continue;
+
+            details.append(" openEnd[").append(index++).append("]=")
+                .append(pos.toShortString()).append("/")
+                .append(openEndWorldState(level, pos));
+        }
+
+        return details.isEmpty() ? line : line + details;
+    }
+
+    private static String openEndWorldState(Level level, BlockPos pos) {
+        BlockState blockState = level.getBlockState(pos);
+        FluidState fluidState = level.getFluidState(pos);
+
+        if (blockState.isAir()) return "air/sourceAirFlow=flowing";
+        if (!fluidState.isEmpty()) {
+            return "fluid=" + fluidState.getType() + "/source=" + fluidState.isSource() + "/sourceAirFlow=blocked";
+        }
+        return "block=" + blockState.getBlock() + "/sourceAirFlow=blocked";
     }
 
     private static boolean touchesSelectedTarget(Set<BlockPos> networkPipes) {
