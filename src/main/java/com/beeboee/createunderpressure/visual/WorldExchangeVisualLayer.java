@@ -110,12 +110,12 @@ public final class WorldExchangeVisualLayer {
     private static void spawnIntakeParticles(Level level, OpenEnd end, FluidState fluidState, double strength) {
         boolean underwater = !fluidState.isEmpty();
         ParticleOptions particle = underwater ? ParticleTypes.BUBBLE : ParticleTypes.SPLASH;
-        spawnDirectionalParticles(level, end, particle, -1.0, underwater, strength);
+        spawnDirectionalParticles(level, end, particle, 1.0, underwater, strength);
     }
 
     private static void spawnOutputParticles(Level level, OpenEnd end, boolean underwater, double strength) {
         ParticleOptions particle = underwater ? ParticleTypes.BUBBLE : ParticleTypes.SPLASH;
-        spawnDirectionalParticles(level, end, particle, 1.0, underwater, strength);
+        spawnDirectionalParticles(level, end, particle, -1.0, underwater, strength);
     }
 
     private static void spawnDirectionalParticles(Level level, OpenEnd end, ParticleOptions particle, double directionMultiplier,
