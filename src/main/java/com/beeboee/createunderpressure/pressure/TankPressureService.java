@@ -155,14 +155,14 @@ public final class TankPressureService {
         if (tanks.size() < 2 || !singleFluidGroup(tanks)) return 0;
 
         int movedTotal = 0;
-        DebugInfo.log(level, "HYDRAULIC frontier contacts={} tanks={} pipes={}", contacts.size(), tanks.size(), scan.pipes.size());
+        DebugInfo.log(level, "HYDRAULIC basin contacts={} tanks={} pipes={}", contacts.size(), tanks.size(), scan.pipes.size());
 
         for (TankContact source : contacts) {
             if (movedTotal >= MAX_HYDRAULIC_SETTLE_MB) break;
             if (!tankCanProvideToPipe(source.pipe, source.face, source.tank)) continue;
 
-            TankContact target = nearestReachableTarget(level, scan, contacts, source);
-            if (target == null) {
+            List<TankContact> receivers = reachableHydraulicTargets(level, scan, contacts, source);
+            if (receivers.isEmpty()) {
                 DebugInfo.log(level, "HYDRAULIC source idle tank={} pipe={} face={} surface={} cutoff={}",
                         source.tank.getController(), source.pipe, source.face, source.head(), source.cutoffSurface());
                 continue;
@@ -174,47 +174,91 @@ public final class TankPressureService {
             int sourceAvailable = sourceCurrent - sourceFloor;
             if (sourceAvailable <= SETTLE_EPSILON_MB) continue;
 
-            int targetCurrent = target.tank.getTankInventory().getFluidAmount();
-            int targetMaxAtSourceHead = amountForSurface(target.tank, Math.min(sourceHead, target.topY()));
-            int targetNeeded = targetMaxAtSourceHead - targetCurrent;
-            if (targetNeeded <= SETTLE_EPSILON_MB) continue;
-
-            int move = Math.min(MAX_HYDRAULIC_SETTLE_MB - movedTotal, Math.min(sourceAvailable, targetNeeded));
-            int moved = moveFluid(source.tank, target.tank, move);
-            if (moved <= 0) {
-                DebugInfo.log(level, "HYDRAULIC frontier move failed source={} target={} requested={} sourceAvailable={} targetNeeded={}",
-                        source.tank.getController(), target.tank.getController(), move, sourceAvailable, targetNeeded);
-                continue;
+            int receiverCapacity = 0;
+            List<TankContact> activeReceivers = new ArrayList<>();
+            for (TankContact target : receivers) {
+                int current = target.tank.getTankInventory().getFluidAmount();
+                int maxAtSourceHead = amountForSurface(target.tank, Math.min(sourceHead, target.topY()));
+                int needed = maxAtSourceHead - current;
+                if (needed > SETTLE_EPSILON_MB) {
+                    activeReceivers.add(target);
+                    receiverCapacity += needed;
+                }
             }
+            if (activeReceivers.isEmpty() || receiverCapacity <= SETTLE_EPSILON_MB) continue;
 
-            movedTotal += moved;
-            DebugInfo.log(level, "HYDRAULIC frontier move source={} target={} sourcePipe={} targetPipe={} moved={} requested={} sourceSurface={} sourceCutoff={} targetSurface={} targetCutoff={} targetMaxAtSourceHead={}",
-                    source.tank.getController(), target.tank.getController(), source.pipe, target.pipe, moved, move,
-                    sourceHead, source.cutoffSurface(), surface(target.tank), target.cutoffSurface(), targetMaxAtSourceHead);
+            int budget = Math.min(MAX_HYDRAULIC_SETTLE_MB - movedTotal, Math.min(sourceAvailable, receiverCapacity));
+            if (budget <= 0) break;
+
+            int receiverCurrentTotal = 0;
+            for (TankContact target : activeReceivers) receiverCurrentTotal += target.tank.getTankInventory().getFluidAmount();
+            double sharedSurface = surfaceForAmount(activeReceivers, receiverCurrentTotal + budget, sourceHead);
+
+            activeReceivers.sort((a, b) -> {
+                int surfaceCompare = Double.compare(surface(a.tank), surface(b.tank));
+                if (surfaceCompare != 0) return surfaceCompare;
+                int distanceCompare = Integer.compare(a.distance, b.distance);
+                if (distanceCompare != 0) return distanceCompare;
+                return compareBlockPos(a.tank.getController(), b.tank.getController());
+            });
+
+            DebugInfo.log(level, "HYDRAULIC basin plan source={} sourceSurface={} sourceCutoff={} sourceAvailable={} receivers={} budget={} sharedSurface={}",
+                    source.tank.getController(), sourceHead, source.cutoffSurface(), sourceAvailable, activeReceivers.size(), budget, sharedSurface);
+
+            for (TankContact target : activeReceivers) {
+                if (movedTotal >= MAX_HYDRAULIC_SETTLE_MB || budget <= 0) break;
+
+                int targetCurrent = target.tank.getTankInventory().getFluidAmount();
+                int targetAtSharedSurface = amountForSurface(target.tank, Math.min(sharedSurface, target.topY()));
+                int targetNeeded = targetAtSharedSurface - targetCurrent;
+                if (targetNeeded <= SETTLE_EPSILON_MB) continue;
+
+                int move = Math.min(budget, targetNeeded);
+                int moved = moveFluid(source.tank, target.tank, move);
+                if (moved <= 0) {
+                    DebugInfo.log(level, "HYDRAULIC basin move failed source={} target={} requested={} sourceAvailable={} targetNeeded={} sharedSurface={}",
+                            source.tank.getController(), target.tank.getController(), move, sourceAvailable, targetNeeded, sharedSurface);
+                    continue;
+                }
+
+                movedTotal += moved;
+                budget -= moved;
+                DebugInfo.log(level, "HYDRAULIC basin move source={} target={} sourcePipe={} targetPipe={} distance={} moved={} requested={} sourceSurface={} sourceCutoff={} targetSurface={} sharedSurface={} targetCutoff={} receivers={}",
+                        source.tank.getController(), target.tank.getController(), source.pipe, target.pipe, target.distance,
+                        moved, move, sourceHead, source.cutoffSurface(), surface(target.tank), sharedSurface,
+                        target.cutoffSurface(), activeReceivers.size());
+            }
         }
 
-        if (movedTotal > 0) DebugInfo.log(level, "HYDRAULIC frontier result moved={}mb", movedTotal);
+        if (movedTotal > 0) DebugInfo.log(level, "HYDRAULIC basin result moved={}mb", movedTotal);
         return movedTotal;
     }
 
-    private static TankContact nearestReachableTarget(Level level, Scan scan, List<TankContact> contacts, TankContact source) {
+    private static List<TankContact> reachableHydraulicTargets(Level level, Scan scan, List<TankContact> contacts, TankContact source) {
         Map<BlockPos, List<TankContact>> byPipe = contactsByPipe(contacts);
+        Map<BlockPos, TankContact> bestByTank = new HashMap<>();
+        Map<BlockPos, Integer> distanceByPipe = new HashMap<>();
         Set<BlockPos> visited = new HashSet<>();
         ArrayDeque<Node> queue = new ArrayDeque<>();
         queue.add(new Node(source.pipe, 0));
         visited.add(source.pipe);
+        distanceByPipe.put(source.pipe, 0);
 
         while (!queue.isEmpty()) {
             Node node = queue.removeFirst();
             List<TankContact> pipeContacts = byPipe.get(node.pos);
             if (pipeContacts != null) {
-                TankContact best = null;
                 for (TankContact candidate : pipeContacts) {
                     if (sameTank(source.tank, candidate.tank)) continue;
                     if (!canHydraulicReceive(source, candidate)) continue;
-                    if (best == null || compareBlockPos(candidate.tank.getController(), best.tank.getController()) < 0) best = candidate;
+
+                    BlockPos key = candidate.tank.getController();
+                    TankContact withDistance = candidate.withDistance(node.distance);
+                    TankContact previous = bestByTank.get(key);
+                    if (previous == null || withDistance.distance < previous.distance) {
+                        bestByTank.put(key, withDistance);
+                    }
                 }
-                if (best != null) return best;
             }
 
             FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, node.pos);
@@ -223,11 +267,44 @@ public final class TankPressureService {
                 BlockPos other = node.pos.relative(face);
                 if (!scan.pipes.contains(other)) continue;
                 if (other.getY() > source.head() + EPSILON) continue;
-                if (visited.add(other)) queue.add(new Node(other, node.distance + 1));
+                if (visited.add(other)) {
+                    int distance = node.distance + 1;
+                    distanceByPipe.put(other, distance);
+                    queue.add(new Node(other, distance));
+                }
             }
         }
 
-        return null;
+        List<TankContact> targets = new ArrayList<>(bestByTank.values());
+        targets.sort((a, b) -> {
+            int distanceCompare = Integer.compare(a.distance, b.distance);
+            if (distanceCompare != 0) return distanceCompare;
+            return compareBlockPos(a.tank.getController(), b.tank.getController());
+        });
+        return targets;
+    }
+
+    private static double surfaceForAmount(List<TankContact> contacts, int totalAmount, double maxSurface) {
+        double low = Double.MAX_VALUE;
+        double high = -Double.MAX_VALUE;
+        Map<BlockPos, FluidTankBlockEntity> tanks = new HashMap<>();
+        for (TankContact contact : contacts) tanks.putIfAbsent(contact.tank.getController(), contact.tank);
+
+        for (FluidTankBlockEntity tank : tanks.values()) {
+            low = Math.min(low, tank.getController().getY());
+            high = Math.max(high, Math.min(maxSurface, tank.getController().getY() + tank.getHeight()));
+        }
+        if (low == Double.MAX_VALUE) return maxSurface;
+
+        high = Math.min(high, maxSurface);
+        for (int i = 0; i < 40; i++) {
+            double mid = (low + high) * 0.5;
+            int amount = 0;
+            for (FluidTankBlockEntity tank : tanks.values()) amount += amountForSurface(tank, mid);
+            if (amount < totalAmount) low = mid;
+            else high = mid;
+        }
+        return (low + high) * 0.5;
     }
 
     private static boolean canHydraulicReceive(TankContact source, TankContact target) {
@@ -249,7 +326,7 @@ public final class TankPressureService {
             for (Direction direction : Direction.values()) {
                 FluidTankBlockEntity tank = tankAt(level, pipePos.relative(direction));
                 if (tank == null) continue;
-                contacts.putIfAbsent(tank.getController() + "|" + pipePos + "|" + direction, new TankContact(tank, pipePos, direction));
+                contacts.putIfAbsent(tank.getController() + "|" + pipePos + "|" + direction, new TankContact(tank, pipePos, direction, 0));
             }
         }
         return new ArrayList<>(contacts.values());
@@ -598,7 +675,7 @@ public final class TankPressureService {
     private record Scan(Set<BlockPos> pipes, List<End> ends) {}
     private record Node(BlockPos pos, int distance) {}
     private record Step(BlockPos from, Direction fromFace, BlockPos to, Direction toFace) {}
-    private record TankContact(FluidTankBlockEntity tank, BlockPos pipe, Direction face) {
+    private record TankContact(FluidTankBlockEntity tank, BlockPos pipe, Direction face, int distance) {
         double head() {
             return surface(tank);
         }
@@ -609,6 +686,10 @@ public final class TankPressureService {
 
         double topY() {
             return tank.getController().getY() + tank.getHeight();
+        }
+
+        TankContact withDistance(int distance) {
+            return new TankContact(tank, pipe, face, distance);
         }
     }
     private record PressureRoute(End source, End target, List<Step> path, double head, double activeHead, double conductance, float pressure) {}
