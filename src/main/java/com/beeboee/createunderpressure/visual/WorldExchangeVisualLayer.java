@@ -83,11 +83,21 @@ public final class WorldExchangeVisualLayer {
             }
 
             int routeHints = applyRouteFlowHints(level, scan, plannedEnds);
-            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} planned={} skipped={} routeHints={} networkVisualFluid={} source=NetworkPressurePlanner/CreatePipeConnection",
-                    owner, scan.openEnds.size(), planned, skipped, routeHints, networkVisualFluid);
+            int refreshes = planned == 0 ? refreshIdlePipeCache(level, scan) : 0;
+            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} planned={} skipped={} routeHints={} refreshes={} networkVisualFluid={} source=NetworkPressurePlanner/CreatePipeConnection",
+                    owner, scan.openEnds.size(), planned, skipped, routeHints, refreshes, networkVisualFluid);
         } finally {
             if (debug) DebugInfo.endNetwork();
         }
+    }
+
+    private static int refreshIdlePipeCache(Level level, VisualScan scan) {
+        int refreshed = 0;
+        for (BlockPos pipe : scan.pipes) {
+            CreatePipeFlowVisualBridge.refresh(level, pipe);
+            refreshed++;
+        }
+        return refreshed;
     }
 
     private static int applyRouteFlowHints(Level level, VisualScan scan, List<PlannedEnd> plannedEnds) {
