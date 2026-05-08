@@ -677,7 +677,7 @@ public final class NetworkPressurePlanner {
     private record Node(BlockPos pos, int distance) {}
     private record Scan(Set<BlockPos> pipes, List<TankContact> tankContacts, List<OpenEnd> openEnds) {}
     private record TankContact(FluidTankBlockEntity tank, BlockPos pipe, Direction face) {
-        double cutoffSurface() { return cutoffSurface(pipe, face, tank); }
+        double cutoffSurface() { return NetworkPressurePlanner.cutoffSurface(pipe, face, tank); }
         double topY() { return tank.getController().getY() + tank.getHeight(); }
     }
     private record OpenEnd(BlockPos pipe, Direction face) {
