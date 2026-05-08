@@ -1,5 +1,6 @@
 package com.beeboee.createunderpressure.visual;
 
+import com.beeboee.createunderpressure.debug.DebugInfo;
 import com.simibubi.create.content.fluids.FluidPropagator;
 import com.simibubi.create.content.fluids.FluidTransportBehaviour;
 import com.simibubi.create.content.fluids.tank.FluidTankBlockEntity;
@@ -33,12 +34,20 @@ public final class WorldExchangeVisualLayer {
 
     public static void tickPipe(FluidTransportBehaviour pipe) {
         Level level = pipe.getWorld();
-        if (level == null || !level.isClientSide) return;
+        if (level == null) return;
         if (level.getGameTime() % TICK_INTERVAL != 0) return;
 
         BlockPos seed = pipe.getPos();
         VisualScan scan = scan(level, seed);
         if (scan.pipes.isEmpty()) return;
+
+        BlockPos owner = ownerPipe(scan.pipes);
+        if (!seed.equals(owner)) return;
+
+        if (!level.isClientSide) {
+            logVisualDecisions(level, scan, owner);
+            return;
+        }
 
         for (OpenEnd end : scan.openEnds) {
             BlockPos worldPos = end.pipe.relative(end.face);
@@ -50,6 +59,46 @@ public final class WorldExchangeVisualLayer {
             } else if (level.getBlockState(worldPos).isAir() && scan.canOutputFromPipe(end.pipe)) {
                 spawnOutputParticles(level, end, false, scan.strength());
             }
+        }
+    }
+
+    private static void logVisualDecisions(Level level, VisualScan scan, BlockPos owner) {
+        if (!DebugInfo.isEnabled(level)) return;
+        DebugInfo.beginNetwork(level, scan.pipes, owner);
+        try {
+            DebugInfo.log(level, "VISUAL scan owner={} openEnds={} tankOutputPipes={} supplyScore={} strength={}",
+                    owner, scan.openEnds.size(), scan.tankOutputPipes.size(), scan.supplyScore, scan.strength());
+
+            for (OpenEnd end : scan.openEnds) {
+                BlockPos worldPos = end.pipe.relative(end.face);
+                if (!level.isLoaded(worldPos)) {
+                    DebugInfo.log(level, "VISUAL skip pipe={} face={} pos={} reason=unloaded", end.pipe, end.face, worldPos);
+                    continue;
+                }
+
+                FluidState worldFluid = level.getFluidState(worldPos);
+                if (!worldFluid.isEmpty()) {
+                    DebugInfo.log(level, "VISUAL intake pipe={} face={} pos={} fluid={} source={} strength={} reason=fluidAtOpenEnd",
+                            end.pipe, end.face, worldPos, worldFluid.getType(), worldFluid.isSource(), scan.strength());
+                    continue;
+                }
+
+                if (!level.getBlockState(worldPos).isAir()) {
+                    DebugInfo.log(level, "VISUAL skip pipe={} face={} pos={} block={} reason=blocked",
+                            end.pipe, end.face, worldPos, level.getBlockState(worldPos).getBlock());
+                    continue;
+                }
+
+                if (scan.canOutputFromPipe(end.pipe)) {
+                    DebugInfo.log(level, "VISUAL output pipe={} face={} pos={} strength={} reason=eligibleTankOutput",
+                            end.pipe, end.face, worldPos, scan.strength());
+                } else {
+                    DebugInfo.log(level, "VISUAL skip pipe={} face={} pos={} reason=noEligibleTankOutput",
+                            end.pipe, end.face, worldPos);
+                }
+            }
+        } finally {
+            DebugInfo.endNetwork();
         }
     }
 
@@ -182,6 +231,20 @@ public final class WorldExchangeVisualLayer {
         if (!(level.getBlockEntity(pos) instanceof FluidTankBlockEntity tank)) return null;
         FluidTankBlockEntity controller = tank.isController() ? tank : tank.getControllerBE();
         return controller == null ? tank : controller;
+    }
+
+    private static BlockPos ownerPipe(Set<BlockPos> pipes) {
+        BlockPos owner = null;
+        for (BlockPos pipe : pipes) {
+            if (owner == null || compareBlockPos(pipe, owner) < 0) owner = pipe;
+        }
+        return owner;
+    }
+
+    private static int compareBlockPos(BlockPos a, BlockPos b) {
+        if (a.getX() != b.getX()) return Integer.compare(a.getX(), b.getX());
+        if (a.getY() != b.getY()) return Integer.compare(a.getY(), b.getY());
+        return Integer.compare(a.getZ(), b.getZ());
     }
 
     private record Node(BlockPos pos, int distance) {}
