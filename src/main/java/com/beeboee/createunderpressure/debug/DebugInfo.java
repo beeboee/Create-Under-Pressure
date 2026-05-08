@@ -388,7 +388,7 @@ public final class DebugInfo {
             }
         }
 
-        while (argIndex < args.length) out.append(' ').append(String.valueOf(args[argIndex++));
+        while (argIndex < args.length) out.append(' ').append(String.valueOf(args[argIndex++]));
         return out.toString();
     }
 
