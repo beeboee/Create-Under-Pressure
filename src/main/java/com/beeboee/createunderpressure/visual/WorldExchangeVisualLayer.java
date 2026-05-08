@@ -1,6 +1,7 @@
 package com.beeboee.createunderpressure.visual;
 
 import com.beeboee.createunderpressure.debug.DebugInfo;
+import com.beeboee.createunderpressure.pressure.CreateWorldEndIO;
 import com.beeboee.createunderpressure.pressure.NetworkPressurePlanner;
 import com.simibubi.create.content.fluids.FluidPropagator;
 import com.simibubi.create.content.fluids.FluidTransportBehaviour;
@@ -9,19 +10,16 @@ import java.util.HashSet;
 import java.util.Set;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
-import net.minecraft.core.particles.ParticleOptions;
-import net.minecraft.core.particles.ParticleTypes;
-import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
+import net.neoforged.neoforge.fluids.FluidStack;
 
 /**
  * Cosmetic-only world exchange effects for open pipe ends.
  *
- * This layer now follows NetworkPressurePlanner's planned actions instead of trying
- * to independently infer whether an end should look active. That keeps visuals from
- * disagreeing with the actual sim.
+ * This layer follows NetworkPressurePlanner's planned actions, but delegates the actual
+ * open-end particle style to Create's PipeConnection helpers.
  */
 public final class WorldExchangeVisualLayer {
     private WorldExchangeVisualLayer() {}
@@ -62,22 +60,33 @@ public final class WorldExchangeVisualLayer {
                 }
 
                 planned++;
-                FluidState fluidState = level.getFluidState(worldPos);
-                boolean underwater = !fluidState.isEmpty();
-                ParticleOptions particle = underwater ? ParticleTypes.BUBBLE : ParticleTypes.SPLASH;
+                FluidStack visualFluid = visualFluid(level, end, action);
+                boolean splashOnRim = action == NetworkPressurePlanner.PlannedVisual.INTAKE;
+                CreateWorldEndIO.spawnCreateParticles(level, end.pipe, end.face, visualFluid, splashOnRim);
 
-                spawnPlannedParticles(level, end, action, particle, underwater);
                 if (debug) {
-                    DebugInfo.log(level, "VISUAL planned pipe={} face={} pos={} action={} underwater={} fluid={} source={}",
-                            end.pipe, end.face, worldPos, action, underwater, fluidState.getType(), fluidState.isSource());
+                    FluidState fluidState = level.getFluidState(worldPos);
+                    DebugInfo.log(level, "VISUAL planned pipe={} face={} pos={} action={} fluid={} source={} visualFluid={} source=CreatePipeConnection",
+                            end.pipe, end.face, worldPos, action, fluidState.getType(), fluidState.isSource(), visualFluid);
                 }
             }
 
-            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} planned={} skipped={} source=NetworkPressurePlanner",
+            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} planned={} skipped={} source=NetworkPressurePlanner/CreatePipeConnection",
                     owner, scan.openEnds.size(), planned, skipped);
         } finally {
             if (debug) DebugInfo.endNetwork();
         }
+    }
+
+    private static FluidStack visualFluid(Level level, OpenEnd end, NetworkPressurePlanner.PlannedVisual action) {
+        if (action == NetworkPressurePlanner.PlannedVisual.INTAKE) {
+            FluidStack drained = CreateWorldEndIO.simulateDrain(level, end.pipe, end.face);
+            if (!drained.isEmpty()) return drained;
+        }
+
+        FluidState fluidState = level.getFluidState(end.worldPos());
+        if (!fluidState.isEmpty()) return new FluidStack(fluidState.getType(), 1000);
+        return FluidStack.EMPTY;
     }
 
     private static VisualScan scan(Level level, BlockPos seed) {
@@ -114,25 +123,6 @@ public final class WorldExchangeVisualLayer {
         }
 
         return new VisualScan(pipes, openEnds);
-    }
-
-    private static void spawnPlannedParticles(Level level, OpenEnd end, NetworkPressurePlanner.PlannedVisual action,
-                                              ParticleOptions particle, boolean underwater) {
-        if (!(level instanceof ServerLevel serverLevel)) return;
-
-        Direction face = end.face;
-        BlockPos worldPos = end.worldPos();
-        double baseOffset = action == NetworkPressurePlanner.PlannedVisual.INTAKE ? 0.25 : -0.42;
-        double x = worldPos.getX() + 0.5 + (face.getStepX() * baseOffset);
-        double y = worldPos.getY() + 0.5 + (face.getStepY() * baseOffset);
-        double z = worldPos.getZ() + 0.5 + (face.getStepZ() * baseOffset);
-
-        // Server particles do not support the same clean directional velocity as the old client-only path.
-        // Keep them sparse and tied strictly to actual planned actions; correctness matters more than spam.
-        int count = underwater ? 2 : 1;
-        double spread = underwater ? 0.08 : 0.04;
-        double speed = action == NetworkPressurePlanner.PlannedVisual.OUTPUT ? 0.045 : 0.025;
-        serverLevel.sendParticles(particle, x, y, z, count, spread, spread, spread, speed);
     }
 
     private static BlockPos ownerPipe(Set<BlockPos> pipes) {
