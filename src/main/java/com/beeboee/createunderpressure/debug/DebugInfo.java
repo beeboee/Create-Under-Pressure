@@ -18,6 +18,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ClientboundSetExperiencePacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
@@ -61,8 +62,6 @@ public final class DebugInfo {
         String stripped = message.strip();
         lastChatMessages.put(player.getUUID(), stripped);
 
-        // When the debug stick is active, chat is usually being used as the human note for the next/active test.
-        // Put those notes directly in the log so the filename is not the only place that context exists.
         if (activeLogFile != null && !endedMessageSent) {
             writeLine("CHAT " + player.getName().getString() + ": " + stripped);
         }
@@ -320,14 +319,26 @@ public final class DebugInfo {
     private static void updateXpCountdown(Level level, Player player) {
         if (player == null || level == null || endedMessageSent || debugUntilGameTime < 0L) return;
         int remaining = (int) remainingSeconds(level);
+        float progress = Math.max(0.0f, Math.min(1.0f, remaining / (float) DEFAULT_SECONDS));
         player.experienceLevel = remaining;
-        player.experienceProgress = Math.max(0.0f, Math.min(1.0f, remaining / (float) DEFAULT_SECONDS));
+        player.experienceProgress = progress;
         player.totalExperience = remaining;
+        syncXp(player);
     }
 
     private static void restoreXpCountdown(Player player) {
         if (player == null || storedXpState == null) return;
         storedXpState.restore(player);
+        syncXp(player);
+    }
+
+    private static void syncXp(Player player) {
+        if (player instanceof ServerPlayer serverPlayer) {
+            serverPlayer.connection.send(new ClientboundSetExperiencePacket(
+                    serverPlayer.experienceProgress,
+                    serverPlayer.totalExperience,
+                    serverPlayer.experienceLevel));
+        }
     }
 
     private static void setGlint(ItemStack stack, boolean enabled) {
