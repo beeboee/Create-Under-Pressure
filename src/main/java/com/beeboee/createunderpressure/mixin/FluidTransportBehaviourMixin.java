@@ -1,5 +1,6 @@
 package com.beeboee.createunderpressure.mixin;
 
+import com.beeboee.createunderpressure.pressure.NetworkHeadBridgeService;
 import com.beeboee.createunderpressure.pressure.NetworkPressurePlanner;
 import com.beeboee.createunderpressure.visual.WorldExchangeVisualLayer;
 import com.simibubi.create.content.fluids.FluidTransportBehaviour;
@@ -14,6 +15,7 @@ public abstract class FluidTransportBehaviourMixin {
     private void createUnderPressure$tickPipePressure(CallbackInfo ci) {
         FluidTransportBehaviour pipe = (FluidTransportBehaviour) (Object) this;
         NetworkPressurePlanner.tickPipe(pipe);
+        NetworkHeadBridgeService.tickPipe(pipe);
         WorldExchangeVisualLayer.tickPipe(pipe);
     }
 }
