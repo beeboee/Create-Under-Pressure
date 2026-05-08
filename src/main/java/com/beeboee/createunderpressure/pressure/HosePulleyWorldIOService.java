@@ -2,7 +2,6 @@ package com.beeboee.createunderpressure.pressure;
 
 import com.beeboee.createunderpressure.debug.DebugInfo;
 import com.beeboee.createunderpressure.visual.CreatePipeFlowVisualBridge;
-import com.beeboee.createunderpressure.visual.CreateWorldEndIO;
 import com.simibubi.create.content.fluids.FluidPropagator;
 import com.simibubi.create.content.fluids.FluidTransportBehaviour;
 import com.simibubi.create.content.fluids.hosePulley.HosePulleyFluidHandler;
