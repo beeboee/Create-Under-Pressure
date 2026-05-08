@@ -42,6 +42,7 @@ public final class NetworkPressurePlanner {
     private static final int MAX_WORLD_INTAKE_MB = 250;
     private static final int WORLD_BLOCK_MB = 1000;
     private static final int WORLD_TRANSFER_INTERVAL = 10;
+    private static final int WORLD_TRANSFER_WARMUP_STEPS = 3;
     private static final int SOURCE_SUPPRESS_TICKS = 80;
     private static final int SOURCE_BREAK_RADIUS = 2;
     private static final int SOURCE_BREAK_LIMIT = 6;
@@ -52,6 +53,7 @@ public final class NetworkPressurePlanner {
     private static final Map<Level, Map<BlockPos, Integer>> SOURCE_DRAWS = new WeakHashMap<>();
     private static final Map<Level, Map<BlockPos, Long>> SUPPRESSED_SOURCES = new WeakHashMap<>();
     private static final Map<Level, Map<PipeFace, PlannedVisual>> VISUALS = new WeakHashMap<>();
+    private static final Map<Level, Map<WorldMoveKey, Integer>> WORLD_WARMUPS = new WeakHashMap<>();
 
     public static void tickPipe(FluidTransportBehaviour pipe) {
         Level level = pipe.getWorld();
@@ -259,6 +261,15 @@ public final class NetworkPressurePlanner {
                 if (stack.isEmpty() || !canPlaceFluidBlock(stack.getFluid())) continue;
                 if (!reachableWithinHead(level, scan, source.pipe, outlet.pipe, surface(source.tank))) continue;
 
+                TankContact priorityTarget = lowerTankNeedingFillBeforeOutlet(level, scan, source, outlet);
+                if (priorityTarget != null) {
+                    DebugInfo.log(level,
+                            "PLANNER tank->world defer source={} outlet={} reason=lowerTankNeedsFill target={} targetSurface={} targetCutoff={} outletHead={}",
+                            source.tank.getController(), outlet.worldPos(), priorityTarget.tank.getController(),
+                            surface(priorityTarget.tank), priorityTarget.cutoffSurface(), outletHead);
+                    continue;
+                }
+
                 int sourceFloor = amountForSurface(source.tank, source.cutoffSurface());
                 int available = source.tank.getTankInventory().getFluidAmount() - sourceFloor;
                 if (available < WORLD_BLOCK_MB) {
@@ -283,6 +294,29 @@ public final class NetworkPressurePlanner {
         }
 
         return 0;
+    }
+
+    private static TankContact lowerTankNeedingFillBeforeOutlet(Level level, Scan scan, TankContact source, OpenEnd outlet) {
+        double sourceSurface = surface(source.tank);
+        double outletHead = outlet.worldPos().getY();
+        FluidStack sourceFluid = source.tank.getTankInventory().getFluid();
+        if (sourceFluid.isEmpty()) return null;
+
+        return scan.tankContacts.stream()
+                .filter(target -> !sameTank(source.tank, target.tank))
+                .filter(target -> canFillWith(target.tank, sourceFluid.getFluid()))
+                .filter(target -> target.cutoffSurface() <= sourceSurface + EPSILON)
+                .filter(target -> reachableWithinHead(level, scan, source.pipe, target.pipe, sourceSurface))
+                .filter(target -> target.pipe.getY() <= outlet.pipe.getY() || target.cutoffSurface() <= outletHead + EPSILON)
+                .filter(target -> {
+                    double fillTo = Math.min(target.topY(), Math.max(target.cutoffSurface(), outletHead));
+                    return surface(target.tank) < fillTo - DEAD_BAND
+                            && target.tank.getTankInventory().getFluidAmount() < amountForSurface(target.tank, fillTo);
+                })
+                .min(Comparator
+                        .comparingDouble((TankContact target) -> surface(target.tank))
+                        .thenComparingInt(target -> target.pipe.distManhattan(source.pipe)))
+                .orElse(null);
     }
 
     private static int transferWorldToWorld(Level level, Scan scan) {
@@ -317,23 +351,58 @@ public final class NetworkPressurePlanner {
             }
 
             targets.sort(Comparator
-                    .comparing((WorldTarget target) -> !target.flowing)
-                    .thenComparingInt(target -> target.place.getY())
+                    .comparingInt((WorldTarget target) -> target.place.getY())
+                    .thenComparing((WorldTarget target) -> !target.flowing)
                     .thenComparingInt(target -> target.distance)
                     .thenComparing(target -> target.place, NetworkPressurePlanner::compareBlockPos));
 
             for (WorldTarget target : targets) {
+                WorldMoveKey warmupKey = new WorldMoveKey(source.source, target.end.pipe, target.end.face, target.place);
+                int warmup = incrementWorldWarmup(level, warmupKey);
+                if (warmup < WORLD_TRANSFER_WARMUP_STEPS) {
+                    addVisual(level, sourceEnd, PlannedVisual.INTAKE);
+                    addVisual(level, target.end, PlannedVisual.OUTPUT);
+                    DebugInfo.log(level,
+                            "PLANNER world->world warmup source={} touched={} target={} outlet={} step={}/{} flowingTarget={}",
+                            source.source, touched, target.place, target.end.worldPos(), warmup, WORLD_TRANSFER_WARMUP_STEPS, target.flowing);
+                    return 0;
+                }
+
+                clearWorldWarmup(level, warmupKey);
                 if (!placeFluid(level, target.place, source.fluid)) continue;
                 recordWorldDraw(level, source, WORLD_BLOCK_MB);
+                cleanInputMouth(level, touched, source.fluid, source.source);
                 addVisual(level, sourceEnd, PlannedVisual.INTAKE);
                 addVisual(level, target.end, PlannedVisual.OUTPUT);
-                DebugInfo.log(level, "PLANNER world->world source={} touched={} target={} outlet={} moved=1000 flowingTarget={} sourceDistance={}",
-                        source.source, touched, target.place, target.end.worldPos(), target.flowing, source.distance);
+                DebugInfo.log(level, "PLANNER world->world source={} touched={} target={} outlet={} moved=1000 flowingTarget={} sourceDistance={} warmupSteps={}",
+                        source.source, touched, target.place, target.end.worldPos(), target.flowing, source.distance, WORLD_TRANSFER_WARMUP_STEPS);
                 return WORLD_BLOCK_MB;
             }
         }
 
         return 0;
+    }
+
+    private static int incrementWorldWarmup(Level level, WorldMoveKey key) {
+        Map<WorldMoveKey, Integer> map = WORLD_WARMUPS.computeIfAbsent(level, $ -> new HashMap<>());
+        int value = map.getOrDefault(key, 0) + 1;
+        map.put(key, value);
+        return value;
+    }
+
+    private static void clearWorldWarmup(Level level, WorldMoveKey key) {
+        Map<WorldMoveKey, Integer> map = WORLD_WARMUPS.get(level);
+        if (map != null) map.remove(key);
+    }
+
+    private static void cleanInputMouth(Level level, BlockPos touched, Fluid fluid, BlockPos consumedSource) {
+        if (touched.equals(consumedSource)) return;
+        FluidState state = level.getFluidState(touched);
+        if (!state.isEmpty() && sameFluidKind(state.getType(), fluid) && !state.isSource()) {
+            level.setBlockAndUpdate(touched, Blocks.AIR.defaultBlockState());
+            suppress(level, touched);
+            DebugInfo.log(level, "PLANNER input cleanup removedFlowing touched={} consumedSource={}", touched, consumedSource);
+        }
     }
 
     private static WorldSource resolveWorldSource(Level level, BlockPos touched, Fluid touchedFluid) {
@@ -461,21 +530,24 @@ public final class NetworkPressurePlanner {
     }
 
     private static BlockPos outletPlacement(Level level, BlockPos outlet, Fluid fluid, int capY, BlockPos source) {
-        if (canPlaceAtOutlet(level, outlet, fluid, capY) && !sameFluidBody(level, source, outlet, fluid)) return outlet;
+        List<OutletCandidate> candidates = new ArrayList<>();
         Set<BlockPos> visited = new HashSet<>();
         ArrayDeque<Node> queue = new ArrayDeque<>();
         queue.add(new Node(outlet, 0));
         visited.add(outlet);
-        BlockPos bestAir = null;
-        int bestAirDistance = Integer.MAX_VALUE;
+
         while (!queue.isEmpty()) {
             Node node = queue.removeFirst();
             if (node.distance > MAX_OUTLET_SEARCH) continue;
-            if (isFlowing(level, node.pos, fluid) && node.pos.getY() <= capY && !sameFluidBody(level, source, node.pos, fluid)) return node.pos;
-            if (level.getBlockState(node.pos).isAir() && node.pos.getY() <= capY && node.distance < bestAirDistance) {
-                bestAir = node.pos;
-                bestAirDistance = node.distance;
+            if (node.pos.getY() <= capY && !sameFluidBody(level, source, node.pos, fluid)) {
+                FluidState state = level.getFluidState(node.pos);
+                if (!state.isEmpty() && sameFluidKind(state.getType(), fluid) && !state.isSource()) {
+                    candidates.add(new OutletCandidate(node.pos, node.distance, true));
+                } else if (level.getBlockState(node.pos).isAir()) {
+                    candidates.add(new OutletCandidate(node.pos, node.distance, false));
+                }
             }
+
             for (Direction direction : new Direction[] {Direction.DOWN, Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST, Direction.UP}) {
                 BlockPos next = node.pos.relative(direction);
                 if (!level.isLoaded(next) || !visited.add(next) || next.getY() > capY) continue;
@@ -483,7 +555,15 @@ public final class NetworkPressurePlanner {
                 if (level.getBlockState(next).isAir() || (!state.isEmpty() && sameFluidKind(state.getType(), fluid))) queue.add(new Node(next, node.distance + 1));
             }
         }
-        return bestAir;
+
+        return candidates.stream()
+                .min(Comparator
+                        .comparingInt((OutletCandidate candidate) -> candidate.pos.getY())
+                        .thenComparing(candidate -> !candidate.flowing)
+                        .thenComparingInt(candidate -> candidate.distance)
+                        .thenComparing(candidate -> candidate.pos, NetworkPressurePlanner::compareBlockPos))
+                .map(candidate -> candidate.pos)
+                .orElse(null);
     }
 
     private static boolean sameFluidBody(Level level, BlockPos a, BlockPos b, Fluid fluid) {
@@ -508,13 +588,6 @@ public final class NetworkPressurePlanner {
             }
         }
         return false;
-    }
-
-    private static boolean canPlaceAtOutlet(Level level, BlockPos pos, Fluid fluid, int capY) {
-        if (pos.getY() > capY) return false;
-        if (level.getBlockState(pos).isAir()) return true;
-        FluidState state = level.getFluidState(pos);
-        return !state.isEmpty() && sameFluidKind(state.getType(), fluid) && !state.isSource();
     }
 
     private static boolean placeFluid(Level level, BlockPos pos, Fluid fluid) {
@@ -685,5 +758,7 @@ public final class NetworkPressurePlanner {
     }
     private record WorldSource(BlockPos touched, BlockPos source, Fluid fluid, int distance) {}
     private record WorldTarget(OpenEnd end, BlockPos place, int distance, boolean flowing) {}
+    private record OutletCandidate(BlockPos pos, int distance, boolean flowing) {}
+    private record WorldMoveKey(BlockPos source, BlockPos outletPipe, Direction outletFace, BlockPos target) {}
     private record PipeFace(BlockPos pipe, Direction face) {}
 }
