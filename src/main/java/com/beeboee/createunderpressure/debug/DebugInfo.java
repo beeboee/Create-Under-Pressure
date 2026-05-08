@@ -50,6 +50,7 @@ public final class DebugInfo {
     private static Path activeLogFile = null;
     private static boolean endedMessageSent = true;
     private static BlockPos selectedTarget = null;
+    private static DebugXpState storedXpState = null;
 
     private static boolean networkContextActive = false;
     private static boolean networkContextAllowed = true;
@@ -94,13 +95,15 @@ public final class DebugInfo {
         activePlayerId = player.getUUID();
         activeStack = stack;
         endedMessageSent = false;
+        if (!extending) storedXpState = DebugXpState.capture(player);
         if (target != null) selectedTarget = target.immutable();
         else if (!extending) selectedTarget = null;
         setGlint(stack, true);
+        updateXpCountdown(level, player);
 
         if (!extending || activeLogFile == null) activeLogFile = newLogFile(player);
 
-        long remainingSeconds = Math.max(0, (debugUntilGameTime - now + 19L) / 20L);
+        long remainingSeconds = remainingSeconds(level);
         String scope = selectedTarget == null ? "global" : "network near " + selectedTarget.toShortString();
         Component message = Component.literal(extending
             ? "Create: Under Pressure debug logging extended by " + seconds + " seconds (" + remainingSeconds + "s remaining, " + scope + ", build " + DEBUG_BUILD + ")"
@@ -112,12 +115,19 @@ public final class DebugInfo {
     }
 
     public static void tick(ServerLevel level) {
-        if (endedMessageSent || debugUntilGameTime < 0L || level.getGameTime() <= debugUntilGameTime) return;
+        if (!endedMessageSent && debugUntilGameTime >= 0L && level.getGameTime() <= debugUntilGameTime) {
+            ServerPlayer player = activePlayerId == null ? null : level.getServer().getPlayerList().getPlayer(activePlayerId);
+            if (player != null) updateXpCountdown(level, player);
+            return;
+        }
+
+        if (endedMessageSent || debugUntilGameTime < 0L) return;
 
         endedMessageSent = true;
         setGlint(activeStack, false);
 
         ServerPlayer player = activePlayerId == null ? null : level.getServer().getPlayerList().getPlayer(activePlayerId);
+        restoreXpCountdown(player);
         Component message = Component.literal("Create: Under Pressure debug logging finished (build " + DEBUG_BUILD + ")");
         if (player != null) player.displayClientMessage(message, true);
 
@@ -128,6 +138,7 @@ public final class DebugInfo {
         activeStack = ItemStack.EMPTY;
         activeLogFile = null;
         selectedTarget = null;
+        storedXpState = null;
         clearNetworkContext();
     }
 
@@ -287,6 +298,7 @@ public final class DebugInfo {
         debugUntilGameTime = level.getGameTime() - 1L;
         endedMessageSent = true;
         setGlint(activeStack, false);
+        restoreXpCountdown(player);
 
         Component message = Component.literal(text + " (build " + DEBUG_BUILD + ")");
         player.displayClientMessage(message, true);
@@ -297,7 +309,25 @@ public final class DebugInfo {
         activeStack = ItemStack.EMPTY;
         activeLogFile = null;
         selectedTarget = null;
+        storedXpState = null;
         clearNetworkContext();
+    }
+
+    private static long remainingSeconds(Level level) {
+        return Math.max(0, (debugUntilGameTime - level.getGameTime() + 19L) / 20L);
+    }
+
+    private static void updateXpCountdown(Level level, Player player) {
+        if (player == null || level == null || endedMessageSent || debugUntilGameTime < 0L) return;
+        int remaining = (int) remainingSeconds(level);
+        player.experienceLevel = remaining;
+        player.experienceProgress = Math.max(0.0f, Math.min(1.0f, remaining / (float) DEFAULT_SECONDS));
+        player.totalExperience = remaining;
+    }
+
+    private static void restoreXpCountdown(Player player) {
+        if (player == null || storedXpState == null) return;
+        storedXpState.restore(player);
     }
 
     private static void setGlint(ItemStack stack, boolean enabled) {
@@ -358,7 +388,19 @@ public final class DebugInfo {
             }
         }
 
-        while (argIndex < args.length) out.append(' ').append(String.valueOf(args[argIndex++]));
+        while (argIndex < args.length) out.append(' ').append(String.valueOf(args[argIndex++));
         return out.toString();
+    }
+
+    private record DebugXpState(int level, float progress, int total) {
+        static DebugXpState capture(Player player) {
+            return new DebugXpState(player.experienceLevel, player.experienceProgress, player.totalExperience);
+        }
+
+        void restore(Player player) {
+            player.experienceLevel = level;
+            player.experienceProgress = progress;
+            player.totalExperience = total;
+        }
     }
 }
