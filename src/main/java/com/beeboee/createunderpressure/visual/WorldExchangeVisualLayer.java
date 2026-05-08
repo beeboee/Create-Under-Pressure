@@ -12,6 +12,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.WeakHashMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
@@ -32,7 +33,10 @@ public final class WorldExchangeVisualLayer {
     private static final int TICK_INTERVAL = 4;
     private static final int MAX_SCAN_DISTANCE = 48;
     private static final int WORLD_BLOCK_MB = 1000;
+    private static final int LINGER_TICKS = 16;
     private static final float CREATE_FLOW_PRESSURE = 64.0f;
+
+    private static final Map<Level, Map<VisualKey, LingeringVisual>> LINGERING_VISUALS = new WeakHashMap<>();
 
     public static void tickPipe(FluidTransportBehaviour pipe) {
         Level level = pipe.getWorld();
@@ -53,22 +57,28 @@ public final class WorldExchangeVisualLayer {
         boolean debug = DebugInfo.isEnabled(level);
         if (debug) DebugInfo.beginNetwork(level, scan.pipes, owner);
         try {
-            int planned = 0;
+            int livePlanned = 0;
+            int lingered = 0;
             int skipped = 0;
             FluidStack networkVisualFluid = networkVisualFluid(level, scan);
             List<PlannedEnd> plannedEnds = new ArrayList<>();
 
             for (OpenEnd end : scan.openEnds) {
                 NetworkPressurePlanner.PlannedVisual action = NetworkPressurePlanner.visualFor(level, end.pipe, end.face);
-                BlockPos worldPos = end.worldPos();
+                boolean live = action != null;
+                if (live) rememberVisual(level, end, action);
+                else action = lingeringVisual(level, end);
 
+                BlockPos worldPos = end.worldPos();
                 if (action == null) {
                     skipped++;
                     if (debug) DebugInfo.log(level, "VISUAL skip pipe={} face={} pos={} reason=noPlannerAction", end.pipe, end.face, worldPos);
                     continue;
                 }
 
-                planned++;
+                if (live) livePlanned++;
+                else lingered++;
+
                 plannedEnds.add(new PlannedEnd(end, action));
                 FluidStack visualFluid = visualFluid(level, end, action, networkVisualFluid);
                 boolean splashOnRim = action == NetworkPressurePlanner.PlannedVisual.INTAKE;
@@ -77,18 +87,35 @@ public final class WorldExchangeVisualLayer {
 
                 if (debug) {
                     FluidState fluidState = level.getFluidState(worldPos);
-                    DebugInfo.log(level, "VISUAL planned pipe={} face={} pos={} action={} fluid={} source={} visualFluid={} networkVisualFluid={} source=CreatePipeConnection flowHint=true",
-                            end.pipe, end.face, worldPos, action, fluidState.getType(), fluidState.isSource(), visualFluid, networkVisualFluid);
+                    DebugInfo.log(level, "VISUAL planned pipe={} face={} pos={} action={} live={} fluid={} source={} visualFluid={} networkVisualFluid={} source=CreatePipeConnection flowHint=true",
+                            end.pipe, end.face, worldPos, action, live, fluidState.getType(), fluidState.isSource(), visualFluid, networkVisualFluid);
                 }
             }
 
             int routeHints = applyRouteFlowHints(level, scan, plannedEnds);
-            int refreshes = planned == 0 ? refreshIdlePipeCache(level, scan) : 0;
-            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} planned={} skipped={} routeHints={} refreshes={} networkVisualFluid={} source=NetworkPressurePlanner/CreatePipeConnection",
-                    owner, scan.openEnds.size(), planned, skipped, routeHints, refreshes, networkVisualFluid);
+            int refreshes = plannedEnds.isEmpty() ? refreshIdlePipeCache(level, scan) : 0;
+            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} livePlanned={} lingered={} skipped={} routeHints={} refreshes={} networkVisualFluid={} source=NetworkPressurePlanner/CreatePipeConnection",
+                    owner, scan.openEnds.size(), livePlanned, lingered, skipped, routeHints, refreshes, networkVisualFluid);
         } finally {
             if (debug) DebugInfo.endNetwork();
         }
+    }
+
+    private static void rememberVisual(Level level, OpenEnd end, NetworkPressurePlanner.PlannedVisual action) {
+        LINGERING_VISUALS
+                .computeIfAbsent(level, $ -> new HashMap<>())
+                .put(new VisualKey(end.pipe, end.face), new LingeringVisual(action, level.getGameTime() + LINGER_TICKS));
+    }
+
+    private static NetworkPressurePlanner.PlannedVisual lingeringVisual(Level level, OpenEnd end) {
+        Map<VisualKey, LingeringVisual> map = LINGERING_VISUALS.get(level);
+        if (map == null) return null;
+        VisualKey key = new VisualKey(end.pipe, end.face);
+        LingeringVisual visual = map.get(key);
+        if (visual == null) return null;
+        if (level.getGameTime() <= visual.untilGameTime) return visual.action;
+        map.remove(key);
+        return null;
     }
 
     private static int refreshIdlePipeCache(Level level, VisualScan scan) {
@@ -259,6 +286,8 @@ public final class WorldExchangeVisualLayer {
     private record Node(BlockPos pos, int distance) {}
     private record PlannedEnd(OpenEnd end, NetworkPressurePlanner.PlannedVisual action) {}
     private record Step(BlockPos from, Direction face, BlockPos to) {}
+    private record VisualKey(BlockPos pipe, Direction face) {}
+    private record LingeringVisual(NetworkPressurePlanner.PlannedVisual action, long untilGameTime) {}
     private record OpenEnd(BlockPos pipe, Direction face) {
         BlockPos worldPos() {
             return pipe.relative(face);
