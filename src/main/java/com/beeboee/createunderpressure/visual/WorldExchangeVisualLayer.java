@@ -12,6 +12,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.level.material.FluidState;
 import net.neoforged.neoforge.fluids.FluidStack;
 
@@ -26,6 +27,7 @@ public final class WorldExchangeVisualLayer {
 
     private static final int TICK_INTERVAL = 4;
     private static final int MAX_SCAN_DISTANCE = 48;
+    private static final int WORLD_BLOCK_MB = 1000;
 
     public static void tickPipe(FluidTransportBehaviour pipe) {
         Level level = pipe.getWorld();
@@ -48,6 +50,7 @@ public final class WorldExchangeVisualLayer {
         try {
             int planned = 0;
             int skipped = 0;
+            FluidStack networkVisualFluid = networkVisualFluid(level, scan);
 
             for (OpenEnd end : scan.openEnds) {
                 NetworkPressurePlanner.PlannedVisual action = NetworkPressurePlanner.visualFor(level, end.pipe, end.face);
@@ -60,33 +63,53 @@ public final class WorldExchangeVisualLayer {
                 }
 
                 planned++;
-                FluidStack visualFluid = visualFluid(level, end, action);
+                FluidStack visualFluid = visualFluid(level, end, action, networkVisualFluid);
                 boolean splashOnRim = action == NetworkPressurePlanner.PlannedVisual.INTAKE;
                 CreateWorldEndIO.spawnCreateParticles(level, end.pipe, end.face, visualFluid, splashOnRim);
 
                 if (debug) {
                     FluidState fluidState = level.getFluidState(worldPos);
-                    DebugInfo.log(level, "VISUAL planned pipe={} face={} pos={} action={} fluid={} source={} visualFluid={} source=CreatePipeConnection",
-                            end.pipe, end.face, worldPos, action, fluidState.getType(), fluidState.isSource(), visualFluid);
+                    DebugInfo.log(level, "VISUAL planned pipe={} face={} pos={} action={} fluid={} source={} visualFluid={} networkVisualFluid={} source=CreatePipeConnection",
+                            end.pipe, end.face, worldPos, action, fluidState.getType(), fluidState.isSource(), visualFluid, networkVisualFluid);
                 }
             }
 
-            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} planned={} skipped={} source=NetworkPressurePlanner/CreatePipeConnection",
-                    owner, scan.openEnds.size(), planned, skipped);
+            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} planned={} skipped={} networkVisualFluid={} source=NetworkPressurePlanner/CreatePipeConnection",
+                    owner, scan.openEnds.size(), planned, skipped, networkVisualFluid);
         } finally {
             if (debug) DebugInfo.endNetwork();
         }
     }
 
-    private static FluidStack visualFluid(Level level, OpenEnd end, NetworkPressurePlanner.PlannedVisual action) {
+    private static FluidStack networkVisualFluid(Level level, VisualScan scan) {
+        for (OpenEnd end : scan.openEnds) {
+            NetworkPressurePlanner.PlannedVisual action = NetworkPressurePlanner.visualFor(level, end.pipe, end.face);
+            if (action != NetworkPressurePlanner.PlannedVisual.INTAKE) continue;
+
+            FluidStack drained = CreateWorldEndIO.simulateDrain(level, end.pipe, end.face);
+            if (!drained.isEmpty()) return drained;
+
+            FluidState fluidState = level.getFluidState(end.worldPos());
+            if (!fluidState.isEmpty()) return new FluidStack(fluidState.getType(), WORLD_BLOCK_MB);
+        }
+
+        for (OpenEnd end : scan.openEnds) {
+            FluidState fluidState = level.getFluidState(end.worldPos());
+            if (!fluidState.isEmpty()) return new FluidStack(fluidState.getType(), WORLD_BLOCK_MB);
+        }
+
+        return new FluidStack(Fluids.WATER, WORLD_BLOCK_MB);
+    }
+
+    private static FluidStack visualFluid(Level level, OpenEnd end, NetworkPressurePlanner.PlannedVisual action, FluidStack networkVisualFluid) {
         if (action == NetworkPressurePlanner.PlannedVisual.INTAKE) {
             FluidStack drained = CreateWorldEndIO.simulateDrain(level, end.pipe, end.face);
             if (!drained.isEmpty()) return drained;
         }
 
         FluidState fluidState = level.getFluidState(end.worldPos());
-        if (!fluidState.isEmpty()) return new FluidStack(fluidState.getType(), 1000);
-        return FluidStack.EMPTY;
+        if (!fluidState.isEmpty()) return new FluidStack(fluidState.getType(), WORLD_BLOCK_MB);
+        return networkVisualFluid.copy();
     }
 
     private static VisualScan scan(Level level, BlockPos seed) {
