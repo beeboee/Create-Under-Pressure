@@ -5,6 +5,7 @@ import com.beeboee.createunderpressure.pressure.CreateWorldEndIO;
 import com.beeboee.createunderpressure.pressure.NetworkPressurePlanner;
 import com.simibubi.create.content.fluids.FluidPropagator;
 import com.simibubi.create.content.fluids.FluidTransportBehaviour;
+import com.simibubi.create.content.fluids.tank.FluidTankBlockEntity;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -25,7 +26,7 @@ import net.neoforged.neoforge.fluids.FluidStack;
  * Cosmetic-only world exchange effects for open pipe ends.
  *
  * This layer follows NetworkPressurePlanner's planned actions, but delegates the actual
- * open-end particle style and pipe flow hints to Create's own helpers.
+ * open-end particle style and pipe flow/fullness hints to Create's own helpers.
  */
 public final class WorldExchangeVisualLayer {
     private WorldExchangeVisualLayer() {}
@@ -35,6 +36,8 @@ public final class WorldExchangeVisualLayer {
     private static final int WORLD_BLOCK_MB = 1000;
     private static final int LINGER_TICKS = 16;
     private static final float CREATE_FLOW_PRESSURE = 64.0f;
+    private static final float PASSIVE_FULLNESS_PRESSURE = 16.0f;
+    private static final double EPSILON = 0.01;
 
     private static final Map<Level, Map<VisualKey, LingeringVisual>> LINGERING_VISUALS = new WeakHashMap<>();
 
@@ -62,6 +65,7 @@ public final class WorldExchangeVisualLayer {
             int skipped = 0;
             FluidStack networkVisualFluid = networkVisualFluid(level, scan);
             List<PlannedEnd> plannedEnds = new ArrayList<>();
+            Set<VisualKey> activeFaces = new HashSet<>();
 
             for (OpenEnd end : scan.openEnds) {
                 NetworkPressurePlanner.PlannedVisual action = NetworkPressurePlanner.visualFor(level, end.pipe, end.face);
@@ -79,6 +83,7 @@ public final class WorldExchangeVisualLayer {
                 if (live) livePlanned++;
                 else lingered++;
 
+                activeFaces.add(new VisualKey(end.pipe, end.face));
                 plannedEnds.add(new PlannedEnd(end, action));
                 FluidStack visualFluid = visualFluid(level, end, action, networkVisualFluid);
                 boolean splashOnRim = action == NetworkPressurePlanner.PlannedVisual.INTAKE;
@@ -92,10 +97,10 @@ public final class WorldExchangeVisualLayer {
                 }
             }
 
-            int routeHints = applyRouteFlowHints(level, scan, plannedEnds);
-            int refreshes = plannedEnds.isEmpty() ? refreshIdlePipeCache(level, scan) : 0;
-            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} livePlanned={} lingered={} skipped={} routeHints={} refreshes={} networkVisualFluid={} source=NetworkPressurePlanner/CreatePipeConnection",
-                    owner, scan.openEnds.size(), livePlanned, lingered, skipped, routeHints, refreshes, networkVisualFluid);
+            int routeHints = applyRouteFlowHints(level, scan, plannedEnds, activeFaces);
+            int passiveHints = applyPassiveFullnessHints(level, scan, activeFaces);
+            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} tankContacts={} livePlanned={} lingered={} skipped={} routeHints={} passiveHints={} networkVisualFluid={} source=NetworkPressurePlanner/CreatePipeConnection",
+                    owner, scan.openEnds.size(), scan.tankContacts.size(), livePlanned, lingered, skipped, routeHints, passiveHints, networkVisualFluid);
         } finally {
             if (debug) DebugInfo.endNetwork();
         }
@@ -118,16 +123,38 @@ public final class WorldExchangeVisualLayer {
         return null;
     }
 
-    private static int refreshIdlePipeCache(Level level, VisualScan scan) {
-        int refreshed = 0;
-        for (BlockPos pipe : scan.pipes) {
-            CreatePipeFlowVisualBridge.refresh(level, pipe);
-            refreshed++;
+    private static int applyPassiveFullnessHints(Level level, VisualScan scan, Set<VisualKey> activeFaces) {
+        int applied = 0;
+
+        for (OpenEnd end : scan.openEnds) {
+            VisualKey key = new VisualKey(end.pipe, end.face);
+            if (activeFaces.contains(key)) continue;
+            FluidState fluidState = level.getFluidState(end.worldPos());
+            if (fluidState.isEmpty()) continue;
+            FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, end.pipe);
+            CreatePipeFlowVisualBridge.apply(level, pipe, end.pipe, end.face, true, PASSIVE_FULLNESS_PRESSURE);
+            activeFaces.add(key);
+            applied++;
+            DebugInfo.log(level, "VISUAL passiveFullness pipe={} face={} pos={} reason=openEndTouchesFluid fluid={} source={}",
+                    end.pipe, end.face, end.worldPos(), fluidState.getType(), fluidState.isSource());
         }
-        return refreshed;
+
+        for (TankContact contact : scan.tankContacts) {
+            VisualKey key = new VisualKey(contact.pipe, contact.face);
+            if (activeFaces.contains(key)) continue;
+            if (!tankCoversContact(contact)) continue;
+            FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, contact.pipe);
+            CreatePipeFlowVisualBridge.apply(level, pipe, contact.pipe, contact.face, true, PASSIVE_FULLNESS_PRESSURE);
+            activeFaces.add(key);
+            applied++;
+            DebugInfo.log(level, "VISUAL passiveFullness pipe={} face={} tank={} reason=tankContactBelowSurface surface={} cutoff={}",
+                    contact.pipe, contact.face, contact.tank.getController(), tankSurface(contact.tank), contact.cutoffSurface());
+        }
+
+        return applied;
     }
 
-    private static int applyRouteFlowHints(Level level, VisualScan scan, List<PlannedEnd> plannedEnds) {
+    private static int applyRouteFlowHints(Level level, VisualScan scan, List<PlannedEnd> plannedEnds, Set<VisualKey> activeFaces) {
         List<PlannedEnd> intakes = new ArrayList<>();
         List<PlannedEnd> outputs = new ArrayList<>();
         for (PlannedEnd planned : plannedEnds) {
@@ -140,7 +167,7 @@ public final class WorldExchangeVisualLayer {
             for (PlannedEnd output : outputs) {
                 List<Step> path = pipePath(level, scan, intake.end.pipe, output.end.pipe);
                 if (path == null) continue;
-                applyPathFlowHints(level, intake.end, output.end, path);
+                applyPathFlowHints(level, intake.end, output.end, path, activeFaces);
                 applied++;
                 DebugInfo.log(level, "VISUAL routeHint intake={} output={} path={}", intake.end.worldPos(), output.end.worldPos(), path.size());
             }
@@ -148,15 +175,19 @@ public final class WorldExchangeVisualLayer {
         return applied;
     }
 
-    private static void applyPathFlowHints(Level level, OpenEnd intake, OpenEnd output, List<Step> path) {
+    private static void applyPathFlowHints(Level level, OpenEnd intake, OpenEnd output, List<Step> path, Set<VisualKey> activeFaces) {
         applyCreateFlowHint(level, intake, NetworkPressurePlanner.PlannedVisual.INTAKE);
+        activeFaces.add(new VisualKey(intake.pipe, intake.face));
         for (Step step : path) {
             FluidTransportBehaviour fromPipe = FluidPropagator.getPipe(level, step.from);
             FluidTransportBehaviour toPipe = FluidPropagator.getPipe(level, step.to);
             CreatePipeFlowVisualBridge.apply(level, fromPipe, step.from, step.face, false, CREATE_FLOW_PRESSURE);
             CreatePipeFlowVisualBridge.apply(level, toPipe, step.to, step.face.getOpposite(), true, CREATE_FLOW_PRESSURE);
+            activeFaces.add(new VisualKey(step.from, step.face));
+            activeFaces.add(new VisualKey(step.to, step.face.getOpposite()));
         }
         applyCreateFlowHint(level, output, NetworkPressurePlanner.PlannedVisual.OUTPUT);
+        activeFaces.add(new VisualKey(output.pipe, output.face));
     }
 
     private static List<Step> pipePath(Level level, VisualScan scan, BlockPos start, BlockPos target) {
@@ -238,6 +269,7 @@ public final class WorldExchangeVisualLayer {
         Set<BlockPos> visited = new HashSet<>();
         ArrayDeque<Node> queue = new ArrayDeque<>();
         Set<OpenEnd> openEnds = new HashSet<>();
+        Set<TankContact> tankContacts = new HashSet<>();
 
         queue.add(new Node(seed, 0));
         visited.add(seed);
@@ -262,11 +294,49 @@ public final class WorldExchangeVisualLayer {
                     continue;
                 }
 
+                FluidTankBlockEntity tank = tankAt(level, other);
+                if (tank != null) {
+                    tankContacts.add(new TankContact(tank, node.pos, face));
+                    continue;
+                }
+
                 if (FluidPropagator.isOpenEnd(level, node.pos, face)) openEnds.add(new OpenEnd(node.pos, face));
             }
         }
 
-        return new VisualScan(pipes, openEnds);
+        return new VisualScan(pipes, openEnds, tankContacts);
+    }
+
+    private static FluidTankBlockEntity tankAt(Level level, BlockPos pos) {
+        if (!(level.getBlockEntity(pos) instanceof FluidTankBlockEntity tank)) return null;
+        FluidTankBlockEntity controller = tank.isController() ? tank : tank.getControllerBE();
+        return controller == null ? tank : controller;
+    }
+
+    private static boolean tankCoversContact(TankContact contact) {
+        return tankSurface(contact.tank) > contact.cutoffSurface() + EPSILON;
+    }
+
+    private static double tankSurface(FluidTankBlockEntity tank) {
+        int amount = tank.getTankInventory().getFluidAmount();
+        if (amount <= 0) return tank.getController().getY();
+        return tank.getController().getY() + (amount / layerCapacity(tank));
+    }
+
+    private static double layerCapacity(FluidTankBlockEntity tank) {
+        return (double) tank.getTankInventory().getCapacity() / (double) Math.max(1, tank.getHeight());
+    }
+
+    private static double cutoffSurface(BlockPos pipe, Direction face, FluidTankBlockEntity tank) {
+        BlockPos tankBlock = pipe.relative(face);
+        double bottom = tank.getController().getY();
+        double top = bottom + tank.getHeight();
+        double cutoff = switch (face) {
+            case UP -> tankBlock.getY();
+            case DOWN -> tankBlock.getY() + 1.0;
+            default -> tankBlock.getY();
+        };
+        return Math.max(bottom, Math.min(top, cutoff));
     }
 
     private static BlockPos ownerPipe(Set<BlockPos> pipes) {
@@ -288,10 +358,15 @@ public final class WorldExchangeVisualLayer {
     private record Step(BlockPos from, Direction face, BlockPos to) {}
     private record VisualKey(BlockPos pipe, Direction face) {}
     private record LingeringVisual(NetworkPressurePlanner.PlannedVisual action, long untilGameTime) {}
+    private record TankContact(FluidTankBlockEntity tank, BlockPos pipe, Direction face) {
+        double cutoffSurface() {
+            return WorldExchangeVisualLayer.cutoffSurface(pipe, face, tank);
+        }
+    }
     private record OpenEnd(BlockPos pipe, Direction face) {
         BlockPos worldPos() {
             return pipe.relative(face);
         }
     }
-    private record VisualScan(Set<BlockPos> pipes, Set<OpenEnd> openEnds) {}
+    private record VisualScan(Set<BlockPos> pipes, Set<OpenEnd> openEnds, Set<TankContact> tankContacts) {}
 }
