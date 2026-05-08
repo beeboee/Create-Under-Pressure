@@ -14,4 +14,9 @@ public final class CreatePipeFlowVisualBridge {
         pipe.addPressure(side, inbound, pressure);
         FluidTransportBehaviour.cacheFlows(level, pipePos);
     }
+
+    public static void refresh(Level level, BlockPos pipePos) {
+        if (level == null || level.isClientSide || pipePos == null) return;
+        FluidTransportBehaviour.cacheFlows(level, pipePos);
+    }
 }
