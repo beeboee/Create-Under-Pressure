@@ -18,7 +18,6 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
-import net.minecraft.network.protocol.game.ClientboundSetExperiencePacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
@@ -51,7 +50,7 @@ public final class DebugInfo {
     private static Path activeLogFile = null;
     private static boolean endedMessageSent = true;
     private static BlockPos selectedTarget = null;
-    private static DebugXpState storedXpState = null;
+    private static DebugStackNameState storedStackNameState = null;
 
     private static boolean networkContextActive = false;
     private static boolean networkContextAllowed = true;
@@ -94,11 +93,11 @@ public final class DebugInfo {
         activePlayerId = player.getUUID();
         activeStack = stack;
         endedMessageSent = false;
-        if (!extending) storedXpState = DebugXpState.capture(player);
+        if (!extending) storedStackNameState = DebugStackNameState.capture(stack);
         if (target != null) selectedTarget = target.immutable();
         else if (!extending) selectedTarget = null;
         setGlint(stack, true);
-        updateXpCountdown(level, player);
+        updateStackCountdown(level);
 
         if (!extending || activeLogFile == null) activeLogFile = newLogFile(player);
 
@@ -115,8 +114,7 @@ public final class DebugInfo {
 
     public static void tick(ServerLevel level) {
         if (!endedMessageSent && debugUntilGameTime >= 0L && level.getGameTime() <= debugUntilGameTime) {
-            ServerPlayer player = activePlayerId == null ? null : level.getServer().getPlayerList().getPlayer(activePlayerId);
-            if (player != null) updateXpCountdown(level, player);
+            updateStackCountdown(level);
             return;
         }
 
@@ -124,9 +122,9 @@ public final class DebugInfo {
 
         endedMessageSent = true;
         setGlint(activeStack, false);
+        restoreStackName();
 
         ServerPlayer player = activePlayerId == null ? null : level.getServer().getPlayerList().getPlayer(activePlayerId);
-        restoreXpCountdown(player);
         Component message = Component.literal("Create: Under Pressure debug logging finished (build " + DEBUG_BUILD + ")");
         if (player != null) player.displayClientMessage(message, true);
 
@@ -137,7 +135,7 @@ public final class DebugInfo {
         activeStack = ItemStack.EMPTY;
         activeLogFile = null;
         selectedTarget = null;
-        storedXpState = null;
+        storedStackNameState = null;
         clearNetworkContext();
     }
 
@@ -297,7 +295,7 @@ public final class DebugInfo {
         debugUntilGameTime = level.getGameTime() - 1L;
         endedMessageSent = true;
         setGlint(activeStack, false);
-        restoreXpCountdown(player);
+        restoreStackName();
 
         Component message = Component.literal(text + " (build " + DEBUG_BUILD + ")");
         player.displayClientMessage(message, true);
@@ -308,7 +306,7 @@ public final class DebugInfo {
         activeStack = ItemStack.EMPTY;
         activeLogFile = null;
         selectedTarget = null;
-        storedXpState = null;
+        storedStackNameState = null;
         clearNetworkContext();
     }
 
@@ -316,29 +314,14 @@ public final class DebugInfo {
         return Math.max(0, (debugUntilGameTime - level.getGameTime() + 19L) / 20L);
     }
 
-    private static void updateXpCountdown(Level level, Player player) {
-        if (player == null || level == null || endedMessageSent || debugUntilGameTime < 0L) return;
-        int remaining = (int) remainingSeconds(level);
-        float progress = Math.max(0.0f, Math.min(1.0f, remaining / (float) DEFAULT_SECONDS));
-        player.experienceLevel = remaining;
-        player.experienceProgress = progress;
-        player.totalExperience = remaining;
-        syncXp(player);
+    private static void updateStackCountdown(Level level) {
+        if (activeStack == null || activeStack.isEmpty() || level == null || endedMessageSent || debugUntilGameTime < 0L) return;
+        activeStack.set(DataComponents.CUSTOM_NAME, Component.literal("Debug: " + remainingSeconds(level) + "s"));
     }
 
-    private static void restoreXpCountdown(Player player) {
-        if (player == null || storedXpState == null) return;
-        storedXpState.restore(player);
-        syncXp(player);
-    }
-
-    private static void syncXp(Player player) {
-        if (player instanceof ServerPlayer serverPlayer) {
-            serverPlayer.connection.send(new ClientboundSetExperiencePacket(
-                    serverPlayer.experienceProgress,
-                    serverPlayer.totalExperience,
-                    serverPlayer.experienceLevel));
-        }
+    private static void restoreStackName() {
+        if (activeStack == null || activeStack.isEmpty() || storedStackNameState == null) return;
+        storedStackNameState.restore(activeStack);
     }
 
     private static void setGlint(ItemStack stack, boolean enabled) {
@@ -403,15 +386,16 @@ public final class DebugInfo {
         return out.toString();
     }
 
-    private record DebugXpState(int level, float progress, int total) {
-        static DebugXpState capture(Player player) {
-            return new DebugXpState(player.experienceLevel, player.experienceProgress, player.totalExperience);
+    private record DebugStackNameState(boolean hadCustomName, Component customName) {
+        static DebugStackNameState capture(ItemStack stack) {
+            Component customName = stack == null || stack.isEmpty() ? null : stack.get(DataComponents.CUSTOM_NAME);
+            return new DebugStackNameState(customName != null, customName);
         }
 
-        void restore(Player player) {
-            player.experienceLevel = level;
-            player.experienceProgress = progress;
-            player.totalExperience = total;
+        void restore(ItemStack stack) {
+            if (stack == null || stack.isEmpty()) return;
+            if (hadCustomName) stack.set(DataComponents.CUSTOM_NAME, customName);
+            else stack.remove(DataComponents.CUSTOM_NAME);
         }
     }
 }
