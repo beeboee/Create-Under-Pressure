@@ -20,7 +20,7 @@ import net.neoforged.neoforge.fluids.FluidStack;
  * Cosmetic-only world exchange effects for open pipe ends.
  *
  * This layer follows NetworkPressurePlanner's planned actions, but delegates the actual
- * open-end particle style to Create's PipeConnection helpers.
+ * open-end particle style and pipe flow hints to Create's own helpers.
  */
 public final class WorldExchangeVisualLayer {
     private WorldExchangeVisualLayer() {}
@@ -28,6 +28,7 @@ public final class WorldExchangeVisualLayer {
     private static final int TICK_INTERVAL = 4;
     private static final int MAX_SCAN_DISTANCE = 48;
     private static final int WORLD_BLOCK_MB = 1000;
+    private static final float CREATE_FLOW_PRESSURE = 64.0f;
 
     public static void tickPipe(FluidTransportBehaviour pipe) {
         Level level = pipe.getWorld();
@@ -66,10 +67,11 @@ public final class WorldExchangeVisualLayer {
                 FluidStack visualFluid = visualFluid(level, end, action, networkVisualFluid);
                 boolean splashOnRim = action == NetworkPressurePlanner.PlannedVisual.INTAKE;
                 CreateWorldEndIO.spawnCreateParticles(level, end.pipe, end.face, visualFluid, splashOnRim);
+                applyCreateFlowHint(level, end, action);
 
                 if (debug) {
                     FluidState fluidState = level.getFluidState(worldPos);
-                    DebugInfo.log(level, "VISUAL planned pipe={} face={} pos={} action={} fluid={} source={} visualFluid={} networkVisualFluid={} source=CreatePipeConnection",
+                    DebugInfo.log(level, "VISUAL planned pipe={} face={} pos={} action={} fluid={} source={} visualFluid={} networkVisualFluid={} source=CreatePipeConnection flowHint=true",
                             end.pipe, end.face, worldPos, action, fluidState.getType(), fluidState.isSource(), visualFluid, networkVisualFluid);
                 }
             }
@@ -79,6 +81,12 @@ public final class WorldExchangeVisualLayer {
         } finally {
             if (debug) DebugInfo.endNetwork();
         }
+    }
+
+    private static void applyCreateFlowHint(Level level, OpenEnd end, NetworkPressurePlanner.PlannedVisual action) {
+        FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, end.pipe);
+        boolean inbound = action == NetworkPressurePlanner.PlannedVisual.INTAKE;
+        CreatePipeFlowVisualBridge.apply(level, pipe, end.pipe, end.face, inbound, CREATE_FLOW_PRESSURE);
     }
 
     private static FluidStack networkVisualFluid(Level level, VisualScan scan) {
