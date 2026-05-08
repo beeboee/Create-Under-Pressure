@@ -15,6 +15,7 @@ import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
@@ -22,15 +23,19 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.SignBlockEntity;
+import net.minecraft.world.level.block.entity.SignText;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
 
 public final class DebugInfo {
     private DebugInfo() {}
 
-    private static final String DEBUG_BUILD = "pressure-graph-v0.1.2/e2550f6+";
+    private static final String DEBUG_BUILD = "pressure-graph-v0.1.2/9aff98f+";
     private static final int DEFAULT_SECONDS = 10;
     private static final int MAX_FILENAME_LABEL_LENGTH = 64;
+    private static final int MAX_NETWORK_LABEL_LENGTH = 32;
     private static final int LOOSE_TARGET_RADIUS = 8;
     private static final Pattern BLOCK_POS_PATTERN = Pattern.compile("BlockPos\\{x=(-?\\d+), y=(-?\\d+), z=(-?\\d+)\\}");
     private static final Pattern OPEN_EXTERNAL_PATTERN = Pattern.compile("external@BlockPos\\{x=(-?\\d+), y=(-?\\d+), z=(-?\\d+)\\}[^ ]*/open=true");
@@ -52,7 +57,14 @@ public final class DebugInfo {
 
     public static void rememberChat(Player player, String message) {
         if (player == null || message == null || message.isBlank()) return;
-        lastChatMessages.put(player.getUUID(), message.strip());
+        String stripped = message.strip();
+        lastChatMessages.put(player.getUUID(), stripped);
+
+        // When the debug stick is active, chat is usually being used as the human note for the next/active test.
+        // Put those notes directly in the log so the filename is not the only place that context exists.
+        if (activeLogFile != null && !endedMessageSent) {
+            writeLine("CHAT " + player.getName().getString() + ": " + stripped);
+        }
     }
 
     public static void toggle(Level level, Player player, ItemStack stack, boolean stop) {
@@ -125,8 +137,8 @@ public final class DebugInfo {
 
     public static boolean beginNetwork(Level level, Set<BlockPos> networkPipes, BlockPos owner) {
         networkContextActive = true;
-        networkContextTag = owner == null ? "net@unknown" : "net@" + owner.toShortString();
         networkContextAllowed = isEnabled(level) && (selectedTarget == null || touchesSelectedTarget(networkPipes));
+        networkContextTag = networkTag(level, networkPipes, owner);
         return networkContextAllowed;
     }
 
@@ -149,6 +161,62 @@ public final class DebugInfo {
 
         CreateUnderPressure.LOGGER.info("{}", formatted);
         writeLine(formatted);
+    }
+
+    private static String networkTag(Level level, Set<BlockPos> networkPipes, BlockPos owner) {
+        String coordinateTag = owner == null ? "net@unknown" : "net@" + owner.toShortString();
+        String label = networkLabel(level, networkPipes);
+        return label == null ? coordinateTag : "net:" + label + "@" + (owner == null ? "unknown" : owner.toShortString());
+    }
+
+    private static String networkLabel(Level level, Set<BlockPos> networkPipes) {
+        if (level == null || networkPipes == null || networkPipes.isEmpty()) return null;
+
+        for (BlockPos pipe : networkPipes) {
+            for (Direction direction : Direction.values()) {
+                BlockPos signPos = pipe.relative(direction);
+                if (!level.isLoaded(signPos)) continue;
+                String label = signLabel(level.getBlockEntity(signPos));
+                if (label != null) return label;
+            }
+        }
+
+        return null;
+    }
+
+    private static String signLabel(BlockEntity blockEntity) {
+        if (!(blockEntity instanceof SignBlockEntity sign)) return null;
+
+        String first = signLine(sign.getFrontText(), 0);
+        String second = signLine(sign.getFrontText(), 1);
+        if (first == null) first = signLine(sign.getBackText(), 0);
+        if (second == null) second = signLine(sign.getBackText(), 1);
+
+        String label;
+        if (first != null && first.equalsIgnoreCase("network") && second != null) label = second;
+        else label = first != null ? first : second;
+
+        if (label == null) return null;
+        label = sanitizedNetworkLabel(label);
+        return label.isBlank() ? null : label;
+    }
+
+    private static String signLine(SignText text, int line) {
+        if (text == null) return null;
+        String value = text.getMessage(line, false).getString().strip();
+        return value.isBlank() ? null : value;
+    }
+
+    private static String sanitizedNetworkLabel(String raw) {
+        String cleaned = raw.strip()
+                .replaceAll("[\\\\/:*?\"<>|]", "")
+                .replaceAll("[^A-Za-z0-9._ -]", "")
+                .replaceAll("\\s+", "_")
+                .replaceAll("_+", "_")
+                .replaceAll("^[._ -]+", "")
+                .replaceAll("[._ -]+$", "");
+        if (cleaned.length() > MAX_NETWORK_LABEL_LENGTH) cleaned = cleaned.substring(0, MAX_NETWORK_LABEL_LENGTH);
+        return cleaned;
     }
 
     private static String enrichOpenExternalEnds(Level level, String line) {
