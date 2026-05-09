@@ -55,19 +55,18 @@ public final class HydraulicPlanWorldIOService {
         ProcessedTick processed = processed(level);
         if (processed.pipes.contains(seed)) return 0;
 
-        HydraulicPlanBuilder.BuildResult result = HydraulicPlanBuilder.build(level, seed, HydraulicPlanRuntime.lastSelectedRouteKeys(level, seed));
+        HydraulicPlanBuilder.BuildResult result = HydraulicPlanRuntime.acquire(level, seed, level.getGameTime());
         HydraulicPlan plan = result.plan();
         if (result.pipes().isEmpty()) return 0;
 
         BlockPos owner = plan.owner();
         if (!seed.equals(owner)) return 0;
         processed.pipes.addAll(result.pipes());
-        HydraulicPlanRuntime.remember(level, result, level.getGameTime());
         tickContexts(level, plan);
 
         DebugInfo.beginNetwork(level, result.pipes(), owner);
         try {
-            DebugInfo.log(level, "HYDRAULIC_WORLD_IO scan owner={} pipes={} actions={} source=SharedPlan", owner, result.pipes().size(), plan.actions().size());
+            DebugInfo.log(level, "HYDRAULIC_WORLD_IO scan owner={} pipes={} actions={} source=SharedPlan cached=true", owner, result.pipes().size(), plan.actions().size());
             for (HydraulicPlan.Action action : plan.actions()) {
                 int moved = switch (action.type()) {
                     case WORLD_TO_TANK -> worldToTank(level, pipe, action);
@@ -76,11 +75,11 @@ public final class HydraulicPlanWorldIOService {
                     default -> 0;
                 };
                 if (moved > 0) {
-                    DebugInfo.log(level, "HYDRAULIC_WORLD_IO moved={} action={} source=SharedPlan", moved, action.type());
+                    DebugInfo.log(level, "HYDRAULIC_WORLD_IO moved={} action={} source=SharedPlan cached=true", moved, action.type());
                     return moved;
                 }
             }
-            DebugInfo.log(level, "HYDRAULIC_WORLD_IO result owner={} moved=0 source=SharedPlan", owner);
+            DebugInfo.log(level, "HYDRAULIC_WORLD_IO result owner={} moved=0 source=SharedPlan cached=true", owner);
             return 0;
         } finally {
             DebugInfo.endNetwork();
@@ -127,7 +126,7 @@ public final class HydraulicPlanWorldIOService {
         }
 
         publish(input, WorldExchangeVisualEvents.Action.INTAKE, drained, level);
-        DebugInfo.log(level, "HYDRAULIC_WORLD_IO world->tank input={} drainRoot={} tank={} moved={} deltaHead={} flowEstimate={} source=SharedPlan",
+        DebugInfo.log(level, "HYDRAULIC_WORLD_IO world->tank input={} drainRoot={} tank={} moved={} deltaHead={} flowEstimate={} source=SharedPlan cached=true",
                 input.owner(), drainRoot, tank.getController(), filled, route.deltaHead(), route.flowEstimateMb());
         return filled;
     }
@@ -171,7 +170,7 @@ public final class HydraulicPlanWorldIOService {
         }
 
         publish(outlet, WorldExchangeVisualEvents.Action.OUTPUT, drained, level);
-        DebugInfo.log(level, "HYDRAULIC_WORLD_IO tank->world tank={} outlet={} moved={} deltaHead={} flowEstimate={} source=SharedPlan",
+        DebugInfo.log(level, "HYDRAULIC_WORLD_IO tank->world tank={} outlet={} moved={} deltaHead={} flowEstimate={} source=SharedPlan cached=true",
                 tank.getController(), outlet.owner(), filled, route.deltaHead(), route.flowEstimateMb());
         return filled;
     }
@@ -208,7 +207,7 @@ public final class HydraulicPlanWorldIOService {
 
         publish(input, WorldExchangeVisualEvents.Action.INTAKE, drained, level);
         publish(output, WorldExchangeVisualEvents.Action.OUTPUT, drained, level);
-        DebugInfo.log(level, "HYDRAULIC_WORLD_IO world->world input={} output={} moved={} deltaHead={} flowEstimate={} source=SharedPlan",
+        DebugInfo.log(level, "HYDRAULIC_WORLD_IO world->world input={} output={} moved={} deltaHead={} flowEstimate={} source=SharedPlan cached=true",
                 input.owner(), output.owner(), filled, route.deltaHead(), route.flowEstimateMb());
         return filled;
     }
