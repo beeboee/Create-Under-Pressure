@@ -32,7 +32,10 @@ public final class HydraulicPlannerDebugService {
 
     private static final int TICK_INTERVAL = 20;
     private static final int MAX_SCAN_DISTANCE = 128;
+    private static final int MAX_PORT_LOGS = 32;
     private static final int MAX_ROUTE_LOGS = 16;
+    private static final int WORLD_BLOCK_MB = 1000;
+    private static final double HEAD_DEAD_BAND = 0.05;
 
     private static final Map<Level, ProcessedTick> PROCESSED = new WeakHashMap<>();
 
@@ -55,10 +58,15 @@ public final class HydraulicPlannerDebugService {
         DebugInfo.beginNetwork(level, snapshot.pipes, owner);
         try {
             List<PlannedRoute> routes = routes(snapshot.ports);
-            DebugInfo.log(level, "HYDRAULIC_PLAN snapshot owner={} pipes={} ports={} routes={} pumps={} note=diagnosticOnly",
-                    owner, snapshot.pipes.size(), snapshot.ports.size(), routes.size(), snapshot.pumps.size());
+            DebugInfo.log(level, "HYDRAULIC_PLAN snapshot owner={} pipes={} ports={} routes={} pumps={} note=diagnosticOnly deadBand={}",
+                    owner, snapshot.pipes.size(), snapshot.ports.size(), routes.size(), snapshot.pumps.size(), HEAD_DEAD_BAND);
 
+            int portLogs = 0;
             for (HydraulicPort port : snapshot.ports) {
+                if (portLogs++ >= MAX_PORT_LOGS) {
+                    DebugInfo.log(level, "HYDRAULIC_PLAN portsTruncated total={} shown={}", snapshot.ports.size(), MAX_PORT_LOGS);
+                    break;
+                }
                 DebugInfo.log(level, "HYDRAULIC_PLAN port id={} type={} owner={} pipe={} face={} head={} amount={} capacity={} fluid={} contacts={}",
                         port.id, port.type, port.owner, port.pipe, port.face, port.head, port.amount, port.capacity, port.fluid, port.contacts);
             }
@@ -66,8 +74,8 @@ public final class HydraulicPlannerDebugService {
             int logged = 0;
             for (PlannedRoute route : routes) {
                 if (logged++ >= MAX_ROUTE_LOGS) break;
-                DebugInfo.log(level, "HYDRAULIC_PLAN route source={} sink={} deltaHead={} sourceType={} sinkType={} note=uncommitted",
-                        route.source.id, route.sink.id, route.deltaHead, route.source.type, route.sink.type);
+                DebugInfo.log(level, "HYDRAULIC_PLAN action={} source={} sink={} deltaHead={} amountHint={} sourceType={} sinkType={} fluid={} note=uncommitted",
+                        route.action, route.source.id, route.sink.id, route.deltaHead, route.amountHint, route.source.type, route.sink.type, route.source.fluid);
             }
         } finally {
             DebugInfo.endNetwork();
@@ -148,20 +156,26 @@ public final class HydraulicPlannerDebugService {
         BlockPos worldPos = pipe.relative(face);
         FluidState fluidState = level.getFluidState(worldPos);
         String fluid = fluidState.isEmpty() ? "empty" : String.valueOf(fluidState.getType());
-        int amount = fluidState.isEmpty() ? 0 : 1000;
+        int amount = fluidState.isEmpty() ? 0 : WORLD_BLOCK_MB;
         double head = fluidState.isEmpty() ? worldPos.getY() : worldPos.getY() + 1.0;
-        return new HydraulicPort("world:" + pipe.toShortString() + ":" + face.getName(), "WORLD", worldPos, pipe, face, head, amount, 1000, fluid, 1);
+        return new HydraulicPort("world:" + pipe.toShortString() + ":" + face.getName(), PortType.WORLD, worldPos, pipe, face, head, amount, WORLD_BLOCK_MB, fluid, 1);
     }
 
     private static List<PlannedRoute> routes(List<HydraulicPort> ports) {
         List<PlannedRoute> routes = new ArrayList<>();
         for (HydraulicPort source : ports) {
-            if (source.amount <= 0) continue;
+            if (source.amount <= 0 || source.fluid.equals("empty")) continue;
             for (HydraulicPort sink : ports) {
                 if (source == sink || sink.capacity - sink.amount <= 0) continue;
+                if (!compatible(source, sink)) continue;
+
                 double deltaHead = source.head - sink.head;
-                if (deltaHead <= 0.0) continue;
-                routes.add(new PlannedRoute(source, sink, deltaHead));
+                if (deltaHead <= HEAD_DEAD_BAND) continue;
+
+                int amountHint = Math.min(source.amount, Math.min(sink.capacity - sink.amount, WORLD_BLOCK_MB));
+                if (amountHint <= 0) continue;
+
+                routes.add(new PlannedRoute(action(source, sink), source, sink, deltaHead, amountHint));
             }
         }
         routes.sort(Comparator
@@ -169,6 +183,17 @@ public final class HydraulicPlannerDebugService {
                 .thenComparing(route -> route.source.id)
                 .thenComparing(route -> route.sink.id));
         return routes;
+    }
+
+    private static boolean compatible(HydraulicPort source, HydraulicPort sink) {
+        return sink.fluid.equals("empty") || source.fluid.equals(sink.fluid);
+    }
+
+    private static Action action(HydraulicPort source, HydraulicPort sink) {
+        if (source.type == PortType.WORLD && sink.type == PortType.WORLD) return Action.WORLD_TO_WORLD;
+        if (source.type == PortType.WORLD) return Action.WORLD_TO_TANK;
+        if (sink.type == PortType.WORLD) return Action.TANK_TO_WORLD;
+        return Action.TANK_TO_TANK;
     }
 
     private static FluidTankBlockEntity tankAt(Level level, BlockPos pos) {
@@ -222,7 +247,7 @@ public final class HydraulicPlannerDebugService {
             String fluid = stack.isEmpty() ? "empty" : String.valueOf(stack.getFluid());
             return new HydraulicPort(
                     "tank:" + tank.getController().toShortString(),
-                    "TANK",
+                    PortType.TANK,
                     tank.getController(),
                     firstPipe,
                     firstFace,
@@ -234,9 +259,11 @@ public final class HydraulicPlannerDebugService {
         }
     }
 
+    private enum PortType { TANK, WORLD }
+    private enum Action { TANK_TO_TANK, TANK_TO_WORLD, WORLD_TO_TANK, WORLD_TO_WORLD }
     private record ProcessedTick(long gameTime, Set<BlockPos> pipes) {}
     private record Node(BlockPos pos, int distance) {}
     private record Snapshot(Set<BlockPos> pipes, List<HydraulicPort> ports, Set<BlockPos> pumps) {}
-    private record HydraulicPort(String id, String type, BlockPos owner, BlockPos pipe, Direction face, double head, int amount, int capacity, String fluid, int contacts) {}
-    private record PlannedRoute(HydraulicPort source, HydraulicPort sink, double deltaHead) {}
+    private record HydraulicPort(String id, PortType type, BlockPos owner, BlockPos pipe, Direction face, double head, int amount, int capacity, String fluid, int contacts) {}
+    private record PlannedRoute(Action action, HydraulicPort source, HydraulicPort sink, double deltaHead, int amountHint) {}
 }
