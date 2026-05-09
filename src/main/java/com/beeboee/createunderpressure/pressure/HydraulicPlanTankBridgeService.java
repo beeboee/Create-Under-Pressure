@@ -36,19 +36,18 @@ public final class HydraulicPlanTankBridgeService {
         ProcessedTick processed = processed(level);
         if (processed.pipes.contains(seed)) return;
 
-        HydraulicPlanBuilder.BuildResult result = HydraulicPlanBuilder.build(level, seed, HydraulicPlanRuntime.lastSelectedRouteKeys(level, seed));
+        HydraulicPlanBuilder.BuildResult result = HydraulicPlanRuntime.acquire(level, seed, level.getGameTime());
         HydraulicPlan plan = result.plan();
         if (result.pipes().isEmpty()) return;
 
         BlockPos owner = plan.owner();
         if (!seed.equals(owner)) return;
         processed.pipes.addAll(result.pipes());
-        HydraulicPlanRuntime.remember(level, result, level.getGameTime());
 
         DebugInfo.beginNetwork(level, result.pipes(), owner);
         try {
             int moved = executeFirstTankBridge(level, plan);
-            if (moved > 0) DebugInfo.log(level, "HYDRAULIC_EXEC tankBridge moved={}mb source=SharedPlan", moved);
+            if (moved > 0) DebugInfo.log(level, "HYDRAULIC_EXEC tankBridge moved={}mb source=SharedPlan cached=true", moved);
         } finally {
             DebugInfo.endNetwork();
         }
@@ -75,7 +74,7 @@ public final class HydraulicPlanTankBridgeService {
             }
 
             DebugInfo.log(level,
-                    "HYDRAULIC_EXEC tank->tank source={} sink={} moved={} amountHint={} deltaHead={} flowEstimate={} routeLength={} resistance={} leased={} source=SharedPlan",
+                    "HYDRAULIC_EXEC tank->tank source={} sink={} moved={} amountHint={} deltaHead={} flowEstimate={} routeLength={} resistance={} leased={} source=SharedPlan cached=true",
                     source.getController(), sink.getController(), moved, action.amountMb(), route.deltaHead(), route.flowEstimateMb(), route.routeLength(), route.resistance(), route.leased());
             return moved;
         }
