@@ -126,7 +126,7 @@ public final class HydraulicPlanBuilder {
     private static HydraulicPlan.Port worldPort(Level level, BlockPos pipe, Direction face) {
         BlockPos worldPos = pipe.relative(face);
         FluidState fluidState = level.getFluidState(worldPos);
-        String fluid = fluidState.isEmpty() ? "empty" : String.valueOf(fluidState.getType());
+        String fluid = normalizedFluid(fluidState);
         int amount = fluidState.isEmpty() ? 0 : WORLD_BLOCK_MB;
         double head = fluidState.isEmpty() ? worldPos.getY() : worldPos.getY() + 1.0;
         return new HydraulicPlan.Port("world:" + pipe.toShortString() + ":" + face.getName(), HydraulicPlan.PortType.WORLD, worldPos, pipe, face, head, amount, WORLD_BLOCK_MB, fluid, 1);
@@ -147,10 +147,10 @@ public final class HydraulicPlanBuilder {
                 int bends = routeBends(source, sink);
                 double resistance = routeResistance(routeLength, bends);
                 int flowEstimate = flowEstimate(deltaHead, resistance);
-                int amountHint = Math.min(flowEstimate, Math.min(source.amountMb(), sink.capacityMb() - sink.amountMb()));
+                HydraulicPlan.ActionType type = actionType(source, sink);
+                int amountHint = amountHint(type, source, sink, flowEstimate);
                 if (amountHint <= 0) continue;
 
-                HydraulicPlan.ActionType type = actionType(source, sink);
                 String routeKey = routeKey(type, source, sink);
                 boolean leased = leasedRouteKeys.contains(routeKey);
                 HydraulicPlan.Route route = new HydraulicPlan.Route(source, sink, deltaHead, routeLength, bends, resistance, flowEstimate, leased);
@@ -159,11 +159,29 @@ public final class HydraulicPlanBuilder {
         }
         routes.sort(Comparator
                 .comparing((Candidate candidate) -> candidate.route.leased()).reversed()
+                .thenComparingInt(HydraulicPlanBuilder::actionPriority)
                 .thenComparingDouble((Candidate candidate) -> candidate.route.deltaHead()).reversed()
                 .thenComparingDouble(candidate -> candidate.route.resistance())
                 .thenComparing(candidate -> candidate.route.source().id())
                 .thenComparing(candidate -> candidate.route.sink().id()));
         return routes;
+    }
+
+    private static int amountHint(HydraulicPlan.ActionType type, HydraulicPlan.Port source, HydraulicPlan.Port sink, int flowEstimate) {
+        int sourceAvailable = source.amountMb();
+        int sinkCapacity = sink.capacityMb() - sink.amountMb();
+        if (involvesWorld(type)) return Math.min(WORLD_BLOCK_MB, Math.min(sourceAvailable, sinkCapacity));
+        return Math.min(flowEstimate, Math.min(sourceAvailable, sinkCapacity));
+    }
+
+    private static int actionPriority(Candidate candidate) {
+        if (candidate.amountHint >= WORLD_BLOCK_MB) {
+            if (candidate.type == HydraulicPlan.ActionType.WORLD_TO_TANK) return 0;
+            if (candidate.type == HydraulicPlan.ActionType.TANK_TO_WORLD) return 1;
+            if (candidate.type == HydraulicPlan.ActionType.WORLD_TO_WORLD) return 2;
+        }
+        if (candidate.type == HydraulicPlan.ActionType.TANK_TO_TANK) return 3;
+        return 4;
     }
 
     private static Selection select(List<Candidate> candidates) {
@@ -200,15 +218,21 @@ public final class HydraulicPlanBuilder {
     private static HydraulicPlan.RejectReason executabilityReject(Candidate candidate) {
         HydraulicPlan.Route route = candidate.route;
         if (!involvesWorld(route)) return null;
-        if (candidate.amountHint < WORLD_BLOCK_MB) return HydraulicPlan.RejectReason.WORLD_BUCKET_REQUIRED;
         if (route.source().type() == HydraulicPlan.PortType.WORLD && route.source().amountMb() < WORLD_BLOCK_MB) return HydraulicPlan.RejectReason.WORLD_SOURCE_BELOW_BUCKET;
         if (route.sink().type() == HydraulicPlan.PortType.WORLD && route.source().amountMb() < WORLD_BLOCK_MB) return HydraulicPlan.RejectReason.WORLD_OUTPUT_SOURCE_BELOW_BUCKET;
         if (route.sink().type() == HydraulicPlan.PortType.WORLD && route.sink().capacityMb() - route.sink().amountMb() < WORLD_BLOCK_MB) return HydraulicPlan.RejectReason.WORLD_OUTPUT_NOT_EMPTY;
+        if (candidate.amountHint < WORLD_BLOCK_MB) return HydraulicPlan.RejectReason.WORLD_BUCKET_REQUIRED;
         return null;
     }
 
     private static boolean involvesWorld(HydraulicPlan.Route route) {
         return route.source().type() == HydraulicPlan.PortType.WORLD || route.sink().type() == HydraulicPlan.PortType.WORLD;
+    }
+
+    private static boolean involvesWorld(HydraulicPlan.ActionType type) {
+        return type == HydraulicPlan.ActionType.WORLD_TO_TANK
+                || type == HydraulicPlan.ActionType.TANK_TO_WORLD
+                || type == HydraulicPlan.ActionType.WORLD_TO_WORLD;
     }
 
     private static boolean compatible(HydraulicPlan.Port source, HydraulicPlan.Port sink) {
@@ -271,6 +295,22 @@ public final class HydraulicPlanBuilder {
         return (double) tank.getTankInventory().getCapacity() / (double) Math.max(1, tank.getHeight());
     }
 
+    private static String normalizedFluid(FluidState fluidState) {
+        if (fluidState.isEmpty()) return "empty";
+        String fluid = String.valueOf(fluidState.getType());
+        if (fluid.equals("minecraft:flowing_water")) return "minecraft:water";
+        if (fluid.equals("minecraft:flowing_lava")) return "minecraft:lava";
+        return fluid;
+    }
+
+    private static String normalizedFluid(FluidStack stack) {
+        if (stack.isEmpty()) return "empty";
+        String fluid = String.valueOf(stack.getFluid());
+        if (fluid.equals("minecraft:flowing_water")) return "minecraft:water";
+        if (fluid.equals("minecraft:flowing_lava")) return "minecraft:lava";
+        return fluid;
+    }
+
     private static BlockPos ownerPipe(Set<BlockPos> pipes) {
         BlockPos owner = null;
         for (BlockPos pipe : pipes) if (owner == null || compareBlockPos(pipe, owner) < 0) owner = pipe;
@@ -303,7 +343,6 @@ public final class HydraulicPlanBuilder {
 
         HydraulicPlan.Port build() {
             FluidStack stack = tank.getTankInventory().getFluid();
-            String fluid = stack.isEmpty() ? "empty" : String.valueOf(stack.getFluid());
             return new HydraulicPlan.Port(
                     "tank:" + tank.getController().toShortString(),
                     HydraulicPlan.PortType.TANK,
@@ -313,7 +352,7 @@ public final class HydraulicPlanBuilder {
                     tankSurface(tank),
                     tank.getTankInventory().getFluidAmount(),
                     tank.getTankInventory().getCapacity(),
-                    fluid,
+                    normalizedFluid(stack),
                     contacts);
         }
     }
