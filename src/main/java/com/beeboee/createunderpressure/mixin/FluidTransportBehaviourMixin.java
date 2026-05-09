@@ -2,8 +2,8 @@ package com.beeboee.createunderpressure.mixin;
 
 import com.beeboee.createunderpressure.pressure.HosePulleyWorldIOService;
 import com.beeboee.createunderpressure.pressure.HydraulicPlanService;
+import com.beeboee.createunderpressure.pressure.HydraulicPlanTankBridgeService;
 import com.beeboee.createunderpressure.pressure.HydraulicPlannerDebugService;
-import com.beeboee.createunderpressure.pressure.NetworkHeadBridgeService;
 import com.beeboee.createunderpressure.visual.WorldExchangeVisualLayer;
 import com.simibubi.create.content.fluids.FluidTransportBehaviour;
 import org.spongepowered.asm.mixin.Mixin;
@@ -18,7 +18,7 @@ public abstract class FluidTransportBehaviourMixin {
         FluidTransportBehaviour pipe = (FluidTransportBehaviour) (Object) this;
         HydraulicPlanService.tickPipe(pipe);
         HosePulleyWorldIOService.tickPipe(pipe);
-        NetworkHeadBridgeService.tickPipe(pipe);
+        HydraulicPlanTankBridgeService.tickPipe(pipe);
         HydraulicPlannerDebugService.tickPipe(pipe);
         WorldExchangeVisualLayer.tickPipe(pipe);
     }
