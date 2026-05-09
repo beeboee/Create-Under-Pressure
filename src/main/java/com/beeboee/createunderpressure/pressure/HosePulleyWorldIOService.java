@@ -21,8 +21,12 @@ import java.util.WeakHashMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.material.Fluids;
 import net.neoforged.neoforge.fluids.FluidStack;
 import net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction;
 
@@ -36,8 +40,10 @@ public final class HosePulleyWorldIOService {
     private HosePulleyWorldIOService() {}
 
     private static final int TICK_INTERVAL = 8;
+    private static final int PREPARE_TICKS = 16;
     private static final int MAX_SCAN_DISTANCE = 128;
     private static final int WORLD_BLOCK_MB = 1000;
+    private static final int FILLABLE_GUARD_RADIUS = 5;
     private static final double EPSILON = 0.01;
     private static final double DEAD_BAND = 0.05;
     private static final float VISUAL_PRESSURE = 64.0f;
@@ -86,9 +92,10 @@ public final class HosePulleyWorldIOService {
 
         for (OpenEnd input : inputs) {
             HoseContext ctx = context(level, ownerPipe, input);
-            FluidStack available = ctx.handler.drain(WORLD_BLOCK_MB, FluidAction.SIMULATE);
+            FluidStack available = ctx.drainable();
             if (available.isEmpty() || available.getAmount() < WORLD_BLOCK_MB) {
-                DebugInfo.log(level, "HOSE_IO world->tank skip input={} reason=noHoseDrain available={}", input.worldPos(), available);
+                DebugInfo.log(level, "HOSE_IO world->tank skip input={} reason=hoseDrainWarmingOrEmpty available={} rootFluid={}",
+                        input.worldPos(), available, level.getFluidState(input.worldPos()).getType());
                 continue;
             }
 
@@ -153,8 +160,12 @@ public final class HosePulleyWorldIOService {
                 }
 
                 FluidStack block = copyWithAmount(stack, WORLD_BLOCK_MB);
-                if (ctx.handler.fill(block, FluidAction.SIMULATE) < WORLD_BLOCK_MB) {
-                    DebugInfo.log(level, "HOSE_IO tank->world skip source={} outlet={} reason=hoseFillRejected stack={}", source.tank.getController(), outlet.worldPos(), block);
+                if (!hasLikelyFillableSpace(level, outlet.worldPos(), block.getFluid())) {
+                    DebugInfo.log(level, "HOSE_IO tank->world skip source={} outlet={} reason=noNearbyFillableSpace stack={}", source.tank.getController(), outlet.worldPos(), block);
+                    continue;
+                }
+                if (!ctx.canDeposit(block.getFluid())) {
+                    DebugInfo.log(level, "HOSE_IO tank->world skip source={} outlet={} reason=hoseFillWarmingOrRejected stack={}", source.tank.getController(), outlet.worldPos(), block);
                     continue;
                 }
 
@@ -182,7 +193,7 @@ public final class HosePulleyWorldIOService {
 
         for (OpenEnd input : scan.openEnds) {
             HoseContext inputCtx = context(level, ownerPipe, input);
-            FluidStack available = inputCtx.handler.drain(WORLD_BLOCK_MB, FluidAction.SIMULATE);
+            FluidStack available = inputCtx.drainable();
             if (available.isEmpty() || available.getAmount() < WORLD_BLOCK_MB) continue;
 
             List<OpenEnd> outputs = new ArrayList<>(scan.openEnds);
@@ -196,7 +207,8 @@ public final class HosePulleyWorldIOService {
                 if (!reachableWithinHead(level, scan, input.pipe, output.pipe, input.worldPos().getY() + 1.0)) continue;
                 HoseContext outputCtx = context(level, ownerPipe, output);
                 FluidStack block = copyWithAmount(available, WORLD_BLOCK_MB);
-                if (outputCtx.handler.fill(block, FluidAction.SIMULATE) < WORLD_BLOCK_MB) continue;
+                if (!hasLikelyFillableSpace(level, output.worldPos(), block.getFluid())) continue;
+                if (!outputCtx.canDeposit(block.getFluid())) continue;
 
                 FluidStack drained = inputCtx.handler.drain(WORLD_BLOCK_MB, FluidAction.EXECUTE);
                 if (drained.isEmpty() || drained.getAmount() < WORLD_BLOCK_MB) continue;
@@ -306,6 +318,39 @@ public final class HosePulleyWorldIOService {
         return false;
     }
 
+    private static boolean hasLikelyFillableSpace(Level level, BlockPos root, Fluid fluid) {
+        Set<BlockPos> visited = new HashSet<>();
+        ArrayDeque<Node> queue = new ArrayDeque<>();
+        queue.add(new Node(root, 0));
+        visited.add(root);
+
+        while (!queue.isEmpty()) {
+            Node node = queue.removeFirst();
+            if (!level.isLoaded(node.pos)) continue;
+            BlockState state = level.getBlockState(node.pos);
+            FluidState fluidState = state.getFluidState();
+            if (isLikelyFillable(level, node.pos, state, fluidState, fluid)) return true;
+            if (node.distance >= FILLABLE_GUARD_RADIUS) continue;
+            for (Direction direction : new Direction[] {Direction.DOWN, Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST}) {
+                BlockPos next = node.pos.relative(direction);
+                if (visited.add(next)) queue.add(new Node(next, node.distance + 1));
+            }
+        }
+
+        return false;
+    }
+
+    private static boolean isLikelyFillable(Level level, BlockPos pos, BlockState state, FluidState fluidState, Fluid fluid) {
+        if (state.hasProperty(BlockStateProperties.WATERLOGGED)) {
+            return fluid.isSame(Fluids.WATER) && !state.getValue(BlockStateProperties.WATERLOGGED);
+        }
+        if (state.getBlock() instanceof LiquidBlock) {
+            return fluidState.getType().isSame(fluid) && state.getValue(LiquidBlock.LEVEL) != 0;
+        }
+        if (!fluidState.isEmpty()) return false;
+        return state.canBeReplaced() || !state.blocksMotion();
+    }
+
     private static FluidStack copyWithAmount(FluidStack stack, int amount) {
         FluidStack copy = stack.copy();
         copy.setAmount(Math.min(amount, stack.getAmount()));
@@ -406,12 +451,37 @@ public final class HosePulleyWorldIOService {
         final FluidFillingBehaviour filler;
         final FluidDrainingBehaviour drainer;
         final HosePulleyFluidHandler handler;
+        final BlockPos root;
 
         HoseContext(FluidTransportBehaviour pipe, BlockPos root) {
+            this.root = root;
             SmartFluidTank internalTank = new SmartFluidTank(WORLD_BLOCK_MB, $ -> {});
             filler = new FluidFillingBehaviour(pipe.blockEntity);
             drainer = new FluidDrainingBehaviour(pipe.blockEntity);
+            drainer.rebuildContext(root);
             handler = new HosePulleyFluidHandler(internalTank, filler, drainer, () -> root, () -> true);
+            prime();
+        }
+
+        FluidStack drainable() {
+            prime();
+            return handler.getFluidInTank(0);
+        }
+
+        boolean canDeposit(Fluid fluid) {
+            for (int i = 0; i < PREPARE_TICKS; i++) {
+                if (filler.tryDeposit(fluid, root, true)) return true;
+                tick();
+            }
+            return filler.tryDeposit(fluid, root, true);
+        }
+
+        void prime() {
+            for (int i = 0; i < PREPARE_TICKS; i++) {
+                FluidStack stack = handler.getFluidInTank(0);
+                if (!stack.isEmpty() && stack.getAmount() >= WORLD_BLOCK_MB) return;
+                tick();
+            }
         }
 
         void tick() {
