@@ -14,8 +14,12 @@ import java.util.Set;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.material.Fluids;
 import net.neoforged.neoforge.fluids.FluidStack;
 
 /**
@@ -37,6 +41,7 @@ public final class HydraulicPlanBuilder {
     public static final double BASE_ROUTE_RESISTANCE = 1.0;
     public static final double PIPE_RESISTANCE = 0.01;
     public static final double BEND_RESISTANCE = 0.08;
+    private static final int FILLABLE_GUARD_RADIUS = 5;
 
     public static BuildResult build(Level level, BlockPos seed, Set<String> leasedRouteKeys) {
         Snapshot snapshot = scan(level, seed);
@@ -45,7 +50,7 @@ public final class HydraulicPlanBuilder {
         }
 
         BlockPos owner = ownerPipe(snapshot.pipes);
-        List<Candidate> candidates = candidates(snapshot.ports, leasedRouteKeys == null ? Set.of() : leasedRouteKeys);
+        List<Candidate> candidates = candidates(level, snapshot.ports, leasedRouteKeys == null ? Set.of() : leasedRouteKeys);
         Selection selection = select(candidates);
 
         List<HydraulicPlan.Action> actions = new ArrayList<>();
@@ -132,12 +137,15 @@ public final class HydraulicPlanBuilder {
         return new HydraulicPlan.Port("world:" + pipe.toShortString() + ":" + face.getName(), HydraulicPlan.PortType.WORLD, worldPos, pipe, face, head, amount, WORLD_BLOCK_MB, fluid, 1);
     }
 
-    private static List<Candidate> candidates(List<HydraulicPlan.Port> ports, Set<String> leasedRouteKeys) {
+    private static List<Candidate> candidates(Level level, List<HydraulicPlan.Port> ports, Set<String> leasedRouteKeys) {
         List<Candidate> routes = new ArrayList<>();
         for (HydraulicPlan.Port source : ports) {
             if (source.amountMb() <= 0 || source.fluid().equals("empty")) continue;
             for (HydraulicPlan.Port sink : ports) {
-                if (source == sink || sink.capacityMb() - sink.amountMb() <= 0) continue;
+                if (source == sink) continue;
+
+                HydraulicPlan.ActionType type = actionType(source, sink);
+                if (!hasSinkRoom(level, type, source, sink)) continue;
                 if (!compatible(source, sink)) continue;
 
                 double deltaHead = source.head() - sink.head();
@@ -147,8 +155,7 @@ public final class HydraulicPlanBuilder {
                 int bends = routeBends(source, sink);
                 double resistance = routeResistance(routeLength, bends);
                 int flowEstimate = flowEstimate(deltaHead, resistance);
-                HydraulicPlan.ActionType type = actionType(source, sink);
-                int amountHint = amountHint(type, source, sink, flowEstimate);
+                int amountHint = amountHint(level, type, source, sink, flowEstimate);
                 if (amountHint <= 0) continue;
 
                 String routeKey = routeKey(type, source, sink);
@@ -167,9 +174,18 @@ public final class HydraulicPlanBuilder {
         return routes;
     }
 
-    private static int amountHint(HydraulicPlan.ActionType type, HydraulicPlan.Port source, HydraulicPlan.Port sink, int flowEstimate) {
+    private static boolean hasSinkRoom(Level level, HydraulicPlan.ActionType type, HydraulicPlan.Port source, HydraulicPlan.Port sink) {
+        if (sink.type() != HydraulicPlan.PortType.WORLD) return sink.capacityMb() - sink.amountMb() > 0;
+        if (sink.fluid().equals("empty")) return true;
+        if (!source.fluid().equals(sink.fluid())) return false;
+        return hasLikelyFillableSpace(level, sink.owner(), source.fluid());
+    }
+
+    private static int amountHint(Level level, HydraulicPlan.ActionType type, HydraulicPlan.Port source, HydraulicPlan.Port sink, int flowEstimate) {
         int sourceAvailable = source.amountMb();
-        int sinkCapacity = sink.capacityMb() - sink.amountMb();
+        int sinkCapacity = sink.type() == HydraulicPlan.PortType.WORLD
+                ? (hasSinkRoom(level, type, source, sink) ? WORLD_BLOCK_MB : 0)
+                : sink.capacityMb() - sink.amountMb();
         if (involvesWorld(type)) return Math.min(WORLD_BLOCK_MB, Math.min(sourceAvailable, sinkCapacity));
         return Math.min(flowEstimate, Math.min(sourceAvailable, sinkCapacity));
     }
@@ -220,7 +236,7 @@ public final class HydraulicPlanBuilder {
         if (!involvesWorld(route)) return null;
         if (route.source().type() == HydraulicPlan.PortType.WORLD && route.source().amountMb() < WORLD_BLOCK_MB) return HydraulicPlan.RejectReason.WORLD_SOURCE_BELOW_BUCKET;
         if (route.sink().type() == HydraulicPlan.PortType.WORLD && route.source().amountMb() < WORLD_BLOCK_MB) return HydraulicPlan.RejectReason.WORLD_OUTPUT_SOURCE_BELOW_BUCKET;
-        if (route.sink().type() == HydraulicPlan.PortType.WORLD && route.sink().capacityMb() - route.sink().amountMb() < WORLD_BLOCK_MB) return HydraulicPlan.RejectReason.WORLD_OUTPUT_NOT_EMPTY;
+        if (route.sink().type() == HydraulicPlan.PortType.WORLD && candidate.amountHint < WORLD_BLOCK_MB) return HydraulicPlan.RejectReason.WORLD_OUTPUT_NOT_EMPTY;
         if (candidate.amountHint < WORLD_BLOCK_MB) return HydraulicPlan.RejectReason.WORLD_BUCKET_REQUIRED;
         return null;
     }
@@ -293,6 +309,43 @@ public final class HydraulicPlanBuilder {
 
     private static double layerCapacity(FluidTankBlockEntity tank) {
         return (double) tank.getTankInventory().getCapacity() / (double) Math.max(1, tank.getHeight());
+    }
+
+    private static boolean hasLikelyFillableSpace(Level level, BlockPos root, String sourceFluid) {
+        Fluid fluid = fluidFromName(sourceFluid);
+        if (fluid == null) return false;
+
+        Set<BlockPos> visited = new HashSet<>();
+        ArrayDeque<Node> queue = new ArrayDeque<>();
+        queue.add(new Node(root, 0));
+        visited.add(root);
+
+        while (!queue.isEmpty()) {
+            Node node = queue.removeFirst();
+            if (!level.isLoaded(node.pos)) continue;
+            BlockState state = level.getBlockState(node.pos);
+            FluidState fluidState = state.getFluidState();
+            if (isLikelyFillable(state, fluidState, fluid)) return true;
+            if (node.distance >= FILLABLE_GUARD_RADIUS) continue;
+            for (Direction direction : new Direction[] {Direction.DOWN, Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST}) {
+                BlockPos next = node.pos.relative(direction);
+                if (visited.add(next)) queue.add(new Node(next, node.distance + 1));
+            }
+        }
+        return false;
+    }
+
+    private static boolean isLikelyFillable(BlockState state, FluidState fluidState, Fluid fluid) {
+        if (state.hasProperty(BlockStateProperties.WATERLOGGED)) return fluid.isSame(Fluids.WATER) && !state.getValue(BlockStateProperties.WATERLOGGED);
+        if (state.getBlock() instanceof LiquidBlock) return fluidState.getType().isSame(fluid) && state.getValue(LiquidBlock.LEVEL) != 0;
+        if (!fluidState.isEmpty()) return false;
+        return state.canBeReplaced() || !state.blocksMotion();
+    }
+
+    private static Fluid fluidFromName(String fluid) {
+        if (fluid.equals("minecraft:water")) return Fluids.WATER;
+        if (fluid.equals("minecraft:lava")) return Fluids.LAVA;
+        return null;
     }
 
     private static String normalizedFluid(FluidState fluidState) {
