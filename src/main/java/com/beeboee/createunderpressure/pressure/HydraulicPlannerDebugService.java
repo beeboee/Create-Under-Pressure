@@ -2,11 +2,10 @@ package com.beeboee.createunderpressure.pressure;
 
 import com.beeboee.createunderpressure.debug.DebugInfo;
 import com.simibubi.create.content.fluids.FluidTransportBehaviour;
-import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.Map;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 
@@ -14,7 +13,8 @@ import net.minecraft.world.level.Level;
  * Diagnostic projection for the shared hydraulic planner core.
  *
  * This intentionally does not move fluid. It asks HydraulicPlanBuilder for the
- * same plan object that executor/visual code can consume later, then logs it.
+ * same plan object that executor/visual code can consume later, stores it in
+ * HydraulicPlanRuntime, then logs it.
  */
 public final class HydraulicPlannerDebugService {
     private HydraulicPlannerDebugService() {}
@@ -24,7 +24,6 @@ public final class HydraulicPlannerDebugService {
     private static final int MAX_ROUTE_LOGS = 16;
 
     private static final Map<Level, ProcessedTick> PROCESSED = new WeakHashMap<>();
-    private static final Map<Level, Map<BlockPos, Set<String>>> LAST_SELECTED_ROUTES = new WeakHashMap<>();
 
     public static void tickPipe(FluidTransportBehaviour pipe) {
         Level level = pipe.getWorld();
@@ -35,18 +34,18 @@ public final class HydraulicPlannerDebugService {
         ProcessedTick processed = processed(level);
         if (processed.pipes.contains(seed)) return;
 
-        HydraulicPlanBuilder.BuildResult result = HydraulicPlanBuilder.build(level, seed, lastSelectedRouteKeys(level, seed));
+        HydraulicPlanBuilder.BuildResult result = HydraulicPlanBuilder.build(level, seed, HydraulicPlanRuntime.lastSelectedRouteKeys(level, seed));
         HydraulicPlan plan = result.plan();
         if (result.pipes().isEmpty()) return;
 
         BlockPos owner = plan.owner();
         if (!seed.equals(owner)) return;
         processed.pipes.addAll(result.pipes());
-        rememberSelectedRoutes(level, owner, plan.actions());
+        HydraulicPlanRuntime.remember(level, result, level.getGameTime());
 
         DebugInfo.beginNetwork(level, result.pipes(), owner);
         try {
-            DebugInfo.log(level, "HYDRAULIC_PLAN snapshot owner={} pipes={} ports={} candidates={} selected={} rejected={} pumps={} leasedCandidates={} note=sharedPlan diagnosticOnly deadBand={} flowScale={} baseR={} pipeR={} bendR={} maxActions={} maxWorldActions={}",
+            DebugInfo.log(level, "HYDRAULIC_PLAN snapshot owner={} pipes={} ports={} candidates={} selected={} rejected={} pumps={} leasedCandidates={} note=sharedPlan cached diagnosticOnly deadBand={} flowScale={} baseR={} pipeR={} bendR={} maxActions={} maxWorldActions={}",
                     owner, plan.pipeCount(), plan.ports().size(), result.candidateCount(), plan.actions().size(), plan.rejectedActions().size(), result.pumpCount(), result.leasedCandidateCount(),
                     HydraulicPlanBuilder.HEAD_DEAD_BAND, HydraulicPlanBuilder.FLOW_SCALE, HydraulicPlanBuilder.BASE_ROUTE_RESISTANCE,
                     HydraulicPlanBuilder.PIPE_RESISTANCE, HydraulicPlanBuilder.BEND_RESISTANCE, HydraulicPlanBuilder.MAX_SELECTED_ACTIONS, HydraulicPlanBuilder.MAX_WORLD_ACTIONS);
@@ -89,20 +88,6 @@ public final class HydraulicPlannerDebugService {
             PROCESSED.put(level, processed);
         }
         return processed;
-    }
-
-    private static Set<String> lastSelectedRouteKeys(Level level, BlockPos owner) {
-        Map<BlockPos, Set<String>> levelRoutes = LAST_SELECTED_ROUTES.get(level);
-        if (levelRoutes == null) return Set.of();
-        Set<String> routes = levelRoutes.get(owner);
-        return routes == null ? Set.of() : routes;
-    }
-
-    private static void rememberSelectedRoutes(Level level, BlockPos owner, java.util.List<HydraulicPlan.Action> selected) {
-        Map<BlockPos, Set<String>> levelRoutes = LAST_SELECTED_ROUTES.computeIfAbsent(level, $ -> new HashMap<>());
-        Set<String> routeKeys = new HashSet<>();
-        for (HydraulicPlan.Action action : selected) routeKeys.add(action.reservationKey());
-        levelRoutes.put(owner, routeKeys);
     }
 
     private record ProcessedTick(long gameTime, Set<BlockPos> pipes) {}
