@@ -45,6 +45,7 @@ public final class HydraulicPlannerDebugService {
     private static final double BEND_RESISTANCE = 0.08;
 
     private static final Map<Level, ProcessedTick> PROCESSED = new WeakHashMap<>();
+    private static final Map<Level, Map<BlockPos, Set<String>>> LAST_SELECTED_ROUTES = new WeakHashMap<>();
 
     public static void tickPipe(FluidTransportBehaviour pipe) {
         Level level = pipe.getWorld();
@@ -64,10 +65,12 @@ public final class HydraulicPlannerDebugService {
 
         DebugInfo.beginNetwork(level, snapshot.pipes, owner);
         try {
-            List<PlannedRoute> candidates = routes(snapshot.ports);
+            Set<String> leasedRouteKeys = lastSelectedRouteKeys(level, owner);
+            List<PlannedRoute> candidates = routes(snapshot.ports, leasedRouteKeys);
             Selection selection = select(candidates);
-            DebugInfo.log(level, "HYDRAULIC_PLAN snapshot owner={} pipes={} ports={} candidates={} selected={} rejected={} pumps={} note=diagnosticOnly deadBand={} flowScale={} baseR={} pipeR={} bendR={} maxActions={} maxWorldActions={}",
-                    owner, snapshot.pipes.size(), snapshot.ports.size(), candidates.size(), selection.selected.size(), selection.rejected.size(), snapshot.pumps.size(), HEAD_DEAD_BAND, FLOW_SCALE, BASE_ROUTE_RESISTANCE, PIPE_RESISTANCE, BEND_RESISTANCE, MAX_SELECTED_ACTIONS, MAX_WORLD_ACTIONS);
+            rememberSelectedRoutes(level, owner, selection.selected);
+            DebugInfo.log(level, "HYDRAULIC_PLAN snapshot owner={} pipes={} ports={} candidates={} selected={} rejected={} pumps={} leasedCandidates={} note=diagnosticOnly deadBand={} flowScale={} baseR={} pipeR={} bendR={} maxActions={} maxWorldActions={}",
+                    owner, snapshot.pipes.size(), snapshot.ports.size(), candidates.size(), selection.selected.size(), selection.rejected.size(), snapshot.pumps.size(), countLeased(candidates), HEAD_DEAD_BAND, FLOW_SCALE, BASE_ROUTE_RESISTANCE, PIPE_RESISTANCE, BEND_RESISTANCE, MAX_SELECTED_ACTIONS, MAX_WORLD_ACTIONS);
 
             int portLogs = 0;
             for (HydraulicPort port : snapshot.ports) {
@@ -82,16 +85,16 @@ public final class HydraulicPlannerDebugService {
             int selectedLogs = 0;
             for (PlannedRoute route : selection.selected) {
                 if (selectedLogs++ >= MAX_ROUTE_LOGS) break;
-                DebugInfo.log(level, "HYDRAULIC_PLAN selected action={} source={} sink={} deltaHead={} routeLength={} bends={} resistance={} flowEstimate={} amountHint={} sourceType={} sinkType={} fluid={} note=executableReservedOnly",
-                        route.action, route.source.id, route.sink.id, route.deltaHead, route.routeLength, route.bends, route.resistance, route.flowEstimate, route.amountHint, route.source.type, route.sink.type, route.source.fluid);
+                DebugInfo.log(level, "HYDRAULIC_PLAN selected action={} source={} sink={} deltaHead={} routeLength={} bends={} resistance={} flowEstimate={} amountHint={} leased={} sourceType={} sinkType={} fluid={} note=executableReservedOnly",
+                        route.action, route.source.id, route.sink.id, route.deltaHead, route.routeLength, route.bends, route.resistance, route.flowEstimate, route.amountHint, route.leased, route.source.type, route.sink.type, route.source.fluid);
             }
 
             int rejectedLogs = 0;
             for (RejectedRoute rejected : selection.rejected) {
                 if (rejectedLogs++ >= MAX_ROUTE_LOGS) break;
                 PlannedRoute route = rejected.route;
-                DebugInfo.log(level, "HYDRAULIC_PLAN rejected reason={} action={} source={} sink={} deltaHead={} routeLength={} bends={} resistance={} flowEstimate={} amountHint={} fluid={} note=diagnosticOnly",
-                        rejected.reason, route.action, route.source.id, route.sink.id, route.deltaHead, route.routeLength, route.bends, route.resistance, route.flowEstimate, route.amountHint, route.source.fluid);
+                DebugInfo.log(level, "HYDRAULIC_PLAN rejected reason={} action={} source={} sink={} deltaHead={} routeLength={} bends={} resistance={} flowEstimate={} amountHint={} leased={} fluid={} note=diagnosticOnly",
+                        rejected.reason, route.action, route.source.id, route.sink.id, route.deltaHead, route.routeLength, route.bends, route.resistance, route.flowEstimate, route.amountHint, route.leased, route.source.fluid);
             }
         } finally {
             DebugInfo.endNetwork();
@@ -177,7 +180,7 @@ public final class HydraulicPlannerDebugService {
         return new HydraulicPort("world:" + pipe.toShortString() + ":" + face.getName(), PortType.WORLD, worldPos, pipe, face, head, amount, WORLD_BLOCK_MB, fluid, 1);
     }
 
-    private static List<PlannedRoute> routes(List<HydraulicPort> ports) {
+    private static List<PlannedRoute> routes(List<HydraulicPort> ports, Set<String> leasedRouteKeys) {
         List<PlannedRoute> routes = new ArrayList<>();
         for (HydraulicPort source : ports) {
             if (source.amount <= 0 || source.fluid.equals("empty")) continue;
@@ -195,11 +198,14 @@ public final class HydraulicPlannerDebugService {
                 int amountHint = Math.min(flowEstimate, Math.min(source.amount, sink.capacity - sink.amount));
                 if (amountHint <= 0) continue;
 
-                routes.add(new PlannedRoute(action(source, sink), source, sink, deltaHead, routeLength, bends, resistance, flowEstimate, amountHint));
+                Action action = action(source, sink);
+                String routeKey = routeKey(action, source, sink);
+                routes.add(new PlannedRoute(action, source, sink, routeKey, deltaHead, routeLength, bends, resistance, flowEstimate, amountHint, leasedRouteKeys.contains(routeKey)));
             }
         }
         routes.sort(Comparator
-                .comparingDouble((PlannedRoute route) -> route.deltaHead).reversed()
+                .comparing((PlannedRoute route) -> route.leased).reversed()
+                .thenComparingDouble((PlannedRoute route) -> route.deltaHead).reversed()
                 .thenComparingDouble(route -> route.resistance)
                 .thenComparing(route -> route.source.id)
                 .thenComparing(route -> route.sink.id));
@@ -278,6 +284,30 @@ public final class HydraulicPlannerDebugService {
         if (source.type == PortType.WORLD) return Action.WORLD_TO_TANK;
         if (sink.type == PortType.WORLD) return Action.TANK_TO_WORLD;
         return Action.TANK_TO_TANK;
+    }
+
+    private static String routeKey(Action action, HydraulicPort source, HydraulicPort sink) {
+        return action + ":" + source.id + "->" + sink.id;
+    }
+
+    private static Set<String> lastSelectedRouteKeys(Level level, BlockPos owner) {
+        Map<BlockPos, Set<String>> levelRoutes = LAST_SELECTED_ROUTES.get(level);
+        if (levelRoutes == null) return Set.of();
+        Set<String> routes = levelRoutes.get(owner);
+        return routes == null ? Set.of() : routes;
+    }
+
+    private static void rememberSelectedRoutes(Level level, BlockPos owner, List<PlannedRoute> selected) {
+        Map<BlockPos, Set<String>> levelRoutes = LAST_SELECTED_ROUTES.computeIfAbsent(level, $ -> new HashMap<>());
+        Set<String> routeKeys = new HashSet<>();
+        for (PlannedRoute route : selected) routeKeys.add(route.routeKey);
+        levelRoutes.put(owner, routeKeys);
+    }
+
+    private static int countLeased(List<PlannedRoute> candidates) {
+        int count = 0;
+        for (PlannedRoute route : candidates) if (route.leased) count++;
+        return count;
     }
 
     private static FluidTankBlockEntity tankAt(Level level, BlockPos pos) {
@@ -385,7 +415,7 @@ public final class HydraulicPlannerDebugService {
     private record Node(BlockPos pos, int distance) {}
     private record Snapshot(Set<BlockPos> pipes, List<HydraulicPort> ports, Set<BlockPos> pumps) {}
     private record HydraulicPort(String id, PortType type, BlockPos owner, BlockPos pipe, Direction face, double head, int amount, int capacity, String fluid, int contacts) {}
-    private record PlannedRoute(Action action, HydraulicPort source, HydraulicPort sink, double deltaHead, int routeLength, int bends, double resistance, int flowEstimate, int amountHint) {
+    private record PlannedRoute(Action action, HydraulicPort source, HydraulicPort sink, String routeKey, double deltaHead, int routeLength, int bends, double resistance, int flowEstimate, int amountHint, boolean leased) {
         boolean involvesWorld() { return source.type == PortType.WORLD || sink.type == PortType.WORLD; }
     }
     private record RejectedRoute(PlannedRoute route, RejectReason reason) {}
