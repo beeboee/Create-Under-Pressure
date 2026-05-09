@@ -40,7 +40,9 @@ public final class HydraulicPlannerDebugService {
     private static final int MAX_FLOW_MB = 1000;
     private static final double HEAD_DEAD_BAND = 0.05;
     private static final double FLOW_SCALE = 600.0;
-    private static final double DEFAULT_ROUTE_RESISTANCE = 1.0;
+    private static final double BASE_ROUTE_RESISTANCE = 1.0;
+    private static final double PIPE_RESISTANCE = 0.01;
+    private static final double BEND_RESISTANCE = 0.08;
 
     private static final Map<Level, ProcessedTick> PROCESSED = new WeakHashMap<>();
 
@@ -64,8 +66,8 @@ public final class HydraulicPlannerDebugService {
         try {
             List<PlannedRoute> candidates = routes(snapshot.ports);
             Selection selection = select(candidates);
-            DebugInfo.log(level, "HYDRAULIC_PLAN snapshot owner={} pipes={} ports={} candidates={} selected={} rejected={} pumps={} note=diagnosticOnly deadBand={} flowScale={} resistance={} maxActions={} maxWorldActions={}",
-                    owner, snapshot.pipes.size(), snapshot.ports.size(), candidates.size(), selection.selected.size(), selection.rejected.size(), snapshot.pumps.size(), HEAD_DEAD_BAND, FLOW_SCALE, DEFAULT_ROUTE_RESISTANCE, MAX_SELECTED_ACTIONS, MAX_WORLD_ACTIONS);
+            DebugInfo.log(level, "HYDRAULIC_PLAN snapshot owner={} pipes={} ports={} candidates={} selected={} rejected={} pumps={} note=diagnosticOnly deadBand={} flowScale={} baseR={} pipeR={} bendR={} maxActions={} maxWorldActions={}",
+                    owner, snapshot.pipes.size(), snapshot.ports.size(), candidates.size(), selection.selected.size(), selection.rejected.size(), snapshot.pumps.size(), HEAD_DEAD_BAND, FLOW_SCALE, BASE_ROUTE_RESISTANCE, PIPE_RESISTANCE, BEND_RESISTANCE, MAX_SELECTED_ACTIONS, MAX_WORLD_ACTIONS);
 
             int portLogs = 0;
             for (HydraulicPort port : snapshot.ports) {
@@ -80,16 +82,16 @@ public final class HydraulicPlannerDebugService {
             int selectedLogs = 0;
             for (PlannedRoute route : selection.selected) {
                 if (selectedLogs++ >= MAX_ROUTE_LOGS) break;
-                DebugInfo.log(level, "HYDRAULIC_PLAN selected action={} source={} sink={} deltaHead={} flowEstimate={} amountHint={} sourceType={} sinkType={} fluid={} note=executableReservedOnly",
-                        route.action, route.source.id, route.sink.id, route.deltaHead, route.flowEstimate, route.amountHint, route.source.type, route.sink.type, route.source.fluid);
+                DebugInfo.log(level, "HYDRAULIC_PLAN selected action={} source={} sink={} deltaHead={} routeLength={} bends={} resistance={} flowEstimate={} amountHint={} sourceType={} sinkType={} fluid={} note=executableReservedOnly",
+                        route.action, route.source.id, route.sink.id, route.deltaHead, route.routeLength, route.bends, route.resistance, route.flowEstimate, route.amountHint, route.source.type, route.sink.type, route.source.fluid);
             }
 
             int rejectedLogs = 0;
             for (RejectedRoute rejected : selection.rejected) {
                 if (rejectedLogs++ >= MAX_ROUTE_LOGS) break;
                 PlannedRoute route = rejected.route;
-                DebugInfo.log(level, "HYDRAULIC_PLAN rejected reason={} action={} source={} sink={} deltaHead={} flowEstimate={} amountHint={} fluid={} note=diagnosticOnly",
-                        rejected.reason, route.action, route.source.id, route.sink.id, route.deltaHead, route.flowEstimate, route.amountHint, route.source.fluid);
+                DebugInfo.log(level, "HYDRAULIC_PLAN rejected reason={} action={} source={} sink={} deltaHead={} routeLength={} bends={} resistance={} flowEstimate={} amountHint={} fluid={} note=diagnosticOnly",
+                        rejected.reason, route.action, route.source.id, route.sink.id, route.deltaHead, route.routeLength, route.bends, route.resistance, route.flowEstimate, route.amountHint, route.source.fluid);
             }
         } finally {
             DebugInfo.endNetwork();
@@ -186,23 +188,45 @@ public final class HydraulicPlannerDebugService {
                 double deltaHead = source.head - sink.head;
                 if (deltaHead <= HEAD_DEAD_BAND) continue;
 
-                int flowEstimate = flowEstimate(deltaHead);
+                int routeLength = routeLength(source, sink);
+                int bends = routeBends(source, sink);
+                double resistance = routeResistance(routeLength, bends);
+                int flowEstimate = flowEstimate(deltaHead, resistance);
                 int amountHint = Math.min(flowEstimate, Math.min(source.amount, sink.capacity - sink.amount));
                 if (amountHint <= 0) continue;
 
-                routes.add(new PlannedRoute(action(source, sink), source, sink, deltaHead, flowEstimate, amountHint));
+                routes.add(new PlannedRoute(action(source, sink), source, sink, deltaHead, routeLength, bends, resistance, flowEstimate, amountHint));
             }
         }
         routes.sort(Comparator
                 .comparingDouble((PlannedRoute route) -> route.deltaHead).reversed()
+                .thenComparingDouble(route -> route.resistance)
                 .thenComparing(route -> route.source.id)
                 .thenComparing(route -> route.sink.id));
         return routes;
     }
 
-    private static int flowEstimate(double deltaHead) {
+    private static int routeLength(HydraulicPort source, HydraulicPort sink) {
+        if (source.pipe == null || sink.pipe == null) return 1;
+        return Math.max(1, source.pipe.distManhattan(sink.pipe));
+    }
+
+    private static int routeBends(HydraulicPort source, HydraulicPort sink) {
+        if (source.pipe == null || sink.pipe == null) return 0;
+        int axes = 0;
+        if (source.pipe.getX() != sink.pipe.getX()) axes++;
+        if (source.pipe.getY() != sink.pipe.getY()) axes++;
+        if (source.pipe.getZ() != sink.pipe.getZ()) axes++;
+        return Math.max(0, axes - 1);
+    }
+
+    private static double routeResistance(int routeLength, int bends) {
+        return BASE_ROUTE_RESISTANCE + routeLength * PIPE_RESISTANCE + bends * BEND_RESISTANCE;
+    }
+
+    private static int flowEstimate(double deltaHead, double resistance) {
         if (deltaHead <= HEAD_DEAD_BAND) return 0;
-        return Math.max(1, Math.min(MAX_FLOW_MB, (int) Math.round(FLOW_SCALE * Math.sqrt(deltaHead) / DEFAULT_ROUTE_RESISTANCE)));
+        return Math.max(1, Math.min(MAX_FLOW_MB, (int) Math.round(FLOW_SCALE * Math.sqrt(deltaHead) / Math.max(0.01, resistance))));
     }
 
     private static Selection select(List<PlannedRoute> candidates) {
@@ -361,7 +385,7 @@ public final class HydraulicPlannerDebugService {
     private record Node(BlockPos pos, int distance) {}
     private record Snapshot(Set<BlockPos> pipes, List<HydraulicPort> ports, Set<BlockPos> pumps) {}
     private record HydraulicPort(String id, PortType type, BlockPos owner, BlockPos pipe, Direction face, double head, int amount, int capacity, String fluid, int contacts) {}
-    private record PlannedRoute(Action action, HydraulicPort source, HydraulicPort sink, double deltaHead, int flowEstimate, int amountHint) {
+    private record PlannedRoute(Action action, HydraulicPort source, HydraulicPort sink, double deltaHead, int routeLength, int bends, double resistance, int flowEstimate, int amountHint) {
         boolean involvesWorld() { return source.type == PortType.WORLD || sink.type == PortType.WORLD; }
     }
     private record RejectedRoute(PlannedRoute route, RejectReason reason) {}
