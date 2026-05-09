@@ -77,7 +77,7 @@ public final class HydraulicPlannerDebugService {
             int selectedLogs = 0;
             for (PlannedRoute route : selection.selected) {
                 if (selectedLogs++ >= MAX_ROUTE_LOGS) break;
-                DebugInfo.log(level, "HYDRAULIC_PLAN selected action={} source={} sink={} deltaHead={} amountHint={} sourceType={} sinkType={} fluid={} note=reservedOnly",
+                DebugInfo.log(level, "HYDRAULIC_PLAN selected action={} source={} sink={} deltaHead={} amountHint={} sourceType={} sinkType={} fluid={} note=executableReservedOnly",
                         route.action, route.source.id, route.sink.id, route.deltaHead, route.amountHint, route.source.type, route.sink.type, route.source.fluid);
             }
 
@@ -85,7 +85,7 @@ public final class HydraulicPlannerDebugService {
             for (RejectedRoute rejected : selection.rejected) {
                 if (rejectedLogs++ >= MAX_ROUTE_LOGS) break;
                 PlannedRoute route = rejected.route;
-                DebugInfo.log(level, "HYDRAULIC_PLAN rejected reason={} action={} source={} sink={} deltaHead={} amountHint={} fluid={} note=reservationOnly",
+                DebugInfo.log(level, "HYDRAULIC_PLAN rejected reason={} action={} source={} sink={} deltaHead={} amountHint={} fluid={} note=diagnosticOnly",
                         rejected.reason, route.action, route.source.id, route.sink.id, route.deltaHead, route.amountHint, route.source.fluid);
             }
         } finally {
@@ -203,6 +203,11 @@ public final class HydraulicPlannerDebugService {
         int worldActions = 0;
 
         for (PlannedRoute route : candidates) {
+            RejectReason executabilityReject = executabilityReject(route);
+            if (executabilityReject != null) {
+                rejected.add(new RejectedRoute(route, executabilityReject));
+                continue;
+            }
             if (selected.size() >= MAX_SELECTED_ACTIONS) {
                 rejected.add(new RejectedRoute(route, RejectReason.ACTION_LIMIT));
                 continue;
@@ -220,6 +225,15 @@ public final class HydraulicPlannerDebugService {
         }
 
         return new Selection(selected, rejected);
+    }
+
+    private static RejectReason executabilityReject(PlannedRoute route) {
+        if (!route.involvesWorld()) return null;
+        if (route.amountHint < WORLD_BLOCK_MB) return RejectReason.WORLD_BUCKET_REQUIRED;
+        if (route.source.type == PortType.WORLD && route.source.amount < WORLD_BLOCK_MB) return RejectReason.WORLD_SOURCE_BELOW_BUCKET;
+        if (route.sink.type == PortType.WORLD && route.source.amount < WORLD_BLOCK_MB) return RejectReason.WORLD_OUTPUT_SOURCE_BELOW_BUCKET;
+        if (route.sink.type == PortType.WORLD && route.sink.capacity - route.sink.amount < WORLD_BLOCK_MB) return RejectReason.WORLD_OUTPUT_NOT_EMPTY;
+        return null;
     }
 
     private static boolean compatible(HydraulicPort source, HydraulicPort sink) {
@@ -333,7 +347,7 @@ public final class HydraulicPlannerDebugService {
 
     private enum PortType { TANK, WORLD }
     private enum Action { TANK_TO_TANK, TANK_TO_WORLD, WORLD_TO_TANK, WORLD_TO_WORLD }
-    private enum RejectReason { ACTION_LIMIT, WORLD_ACTION_LIMIT, RESERVED_PORT }
+    private enum RejectReason { ACTION_LIMIT, WORLD_ACTION_LIMIT, RESERVED_PORT, WORLD_BUCKET_REQUIRED, WORLD_SOURCE_BELOW_BUCKET, WORLD_OUTPUT_SOURCE_BELOW_BUCKET, WORLD_OUTPUT_NOT_EMPTY }
     private record ProcessedTick(long gameTime, Set<BlockPos> pipes) {}
     private record Node(BlockPos pos, int distance) {}
     private record Snapshot(Set<BlockPos> pipes, List<HydraulicPort> ports, Set<BlockPos> pumps) {}
