@@ -34,6 +34,8 @@ public final class HydraulicPlannerDebugService {
     private static final int MAX_SCAN_DISTANCE = 128;
     private static final int MAX_PORT_LOGS = 32;
     private static final int MAX_ROUTE_LOGS = 16;
+    private static final int MAX_SELECTED_ACTIONS = 4;
+    private static final int MAX_WORLD_ACTIONS = 1;
     private static final int WORLD_BLOCK_MB = 1000;
     private static final double HEAD_DEAD_BAND = 0.05;
 
@@ -57,9 +59,10 @@ public final class HydraulicPlannerDebugService {
 
         DebugInfo.beginNetwork(level, snapshot.pipes, owner);
         try {
-            List<PlannedRoute> routes = routes(snapshot.ports);
-            DebugInfo.log(level, "HYDRAULIC_PLAN snapshot owner={} pipes={} ports={} routes={} pumps={} note=diagnosticOnly deadBand={}",
-                    owner, snapshot.pipes.size(), snapshot.ports.size(), routes.size(), snapshot.pumps.size(), HEAD_DEAD_BAND);
+            List<PlannedRoute> candidates = routes(snapshot.ports);
+            Selection selection = select(candidates);
+            DebugInfo.log(level, "HYDRAULIC_PLAN snapshot owner={} pipes={} ports={} candidates={} selected={} rejected={} pumps={} note=diagnosticOnly deadBand={} maxActions={} maxWorldActions={}",
+                    owner, snapshot.pipes.size(), snapshot.ports.size(), candidates.size(), selection.selected.size(), selection.rejected.size(), snapshot.pumps.size(), HEAD_DEAD_BAND, MAX_SELECTED_ACTIONS, MAX_WORLD_ACTIONS);
 
             int portLogs = 0;
             for (HydraulicPort port : snapshot.ports) {
@@ -71,11 +74,19 @@ public final class HydraulicPlannerDebugService {
                         port.id, port.type, port.owner, port.pipe, port.face, port.head, port.amount, port.capacity, port.fluid, port.contacts);
             }
 
-            int logged = 0;
-            for (PlannedRoute route : routes) {
-                if (logged++ >= MAX_ROUTE_LOGS) break;
-                DebugInfo.log(level, "HYDRAULIC_PLAN action={} source={} sink={} deltaHead={} amountHint={} sourceType={} sinkType={} fluid={} note=uncommitted",
+            int selectedLogs = 0;
+            for (PlannedRoute route : selection.selected) {
+                if (selectedLogs++ >= MAX_ROUTE_LOGS) break;
+                DebugInfo.log(level, "HYDRAULIC_PLAN selected action={} source={} sink={} deltaHead={} amountHint={} sourceType={} sinkType={} fluid={} note=reservedOnly",
                         route.action, route.source.id, route.sink.id, route.deltaHead, route.amountHint, route.source.type, route.sink.type, route.source.fluid);
+            }
+
+            int rejectedLogs = 0;
+            for (RejectedRoute rejected : selection.rejected) {
+                if (rejectedLogs++ >= MAX_ROUTE_LOGS) break;
+                PlannedRoute route = rejected.route;
+                DebugInfo.log(level, "HYDRAULIC_PLAN rejected reason={} action={} source={} sink={} deltaHead={} amountHint={} fluid={} note=reservationOnly",
+                        rejected.reason, route.action, route.source.id, route.sink.id, route.deltaHead, route.amountHint, route.source.fluid);
             }
         } finally {
             DebugInfo.endNetwork();
@@ -185,6 +196,32 @@ public final class HydraulicPlannerDebugService {
         return routes;
     }
 
+    private static Selection select(List<PlannedRoute> candidates) {
+        ReservationSet reservations = new ReservationSet();
+        List<PlannedRoute> selected = new ArrayList<>();
+        List<RejectedRoute> rejected = new ArrayList<>();
+        int worldActions = 0;
+
+        for (PlannedRoute route : candidates) {
+            if (selected.size() >= MAX_SELECTED_ACTIONS) {
+                rejected.add(new RejectedRoute(route, RejectReason.ACTION_LIMIT));
+                continue;
+            }
+            if (route.involvesWorld() && worldActions >= MAX_WORLD_ACTIONS) {
+                rejected.add(new RejectedRoute(route, RejectReason.WORLD_ACTION_LIMIT));
+                continue;
+            }
+            if (!reservations.reserve(route)) {
+                rejected.add(new RejectedRoute(route, RejectReason.RESERVED_PORT));
+                continue;
+            }
+            selected.add(route);
+            if (route.involvesWorld()) worldActions++;
+        }
+
+        return new Selection(selected, rejected);
+    }
+
     private static boolean compatible(HydraulicPort source, HydraulicPort sink) {
         return sink.fluid.equals("empty") || source.fluid.equals(sink.fluid);
     }
@@ -259,11 +296,51 @@ public final class HydraulicPlannerDebugService {
         }
     }
 
+    private static final class ReservationSet {
+        private final Set<String> sourceKeys = new HashSet<>();
+        private final Set<String> sinkKeys = new HashSet<>();
+        private final Set<String> worldKeys = new HashSet<>();
+
+        boolean reserve(PlannedRoute route) {
+            String sourceKey = sourceKey(route.source);
+            String sinkKey = sinkKey(route.sink);
+            String worldSourceKey = route.source.type == PortType.WORLD ? worldKey(route.source) : null;
+            String worldSinkKey = route.sink.type == PortType.WORLD ? worldKey(route.sink) : null;
+
+            if (sourceKeys.contains(sourceKey) || sinkKeys.contains(sinkKey)) return false;
+            if (worldSourceKey != null && worldKeys.contains(worldSourceKey)) return false;
+            if (worldSinkKey != null && worldKeys.contains(worldSinkKey)) return false;
+
+            sourceKeys.add(sourceKey);
+            sinkKeys.add(sinkKey);
+            if (worldSourceKey != null) worldKeys.add(worldSourceKey);
+            if (worldSinkKey != null) worldKeys.add(worldSinkKey);
+            return true;
+        }
+
+        private static String sourceKey(HydraulicPort port) {
+            return port.type + ":source:" + port.owner;
+        }
+
+        private static String sinkKey(HydraulicPort port) {
+            return port.type + ":sink:" + port.owner;
+        }
+
+        private static String worldKey(HydraulicPort port) {
+            return "WORLD:" + port.owner;
+        }
+    }
+
     private enum PortType { TANK, WORLD }
     private enum Action { TANK_TO_TANK, TANK_TO_WORLD, WORLD_TO_TANK, WORLD_TO_WORLD }
+    private enum RejectReason { ACTION_LIMIT, WORLD_ACTION_LIMIT, RESERVED_PORT }
     private record ProcessedTick(long gameTime, Set<BlockPos> pipes) {}
     private record Node(BlockPos pos, int distance) {}
     private record Snapshot(Set<BlockPos> pipes, List<HydraulicPort> ports, Set<BlockPos> pumps) {}
     private record HydraulicPort(String id, PortType type, BlockPos owner, BlockPos pipe, Direction face, double head, int amount, int capacity, String fluid, int contacts) {}
-    private record PlannedRoute(Action action, HydraulicPort source, HydraulicPort sink, double deltaHead, int amountHint) {}
+    private record PlannedRoute(Action action, HydraulicPort source, HydraulicPort sink, double deltaHead, int amountHint) {
+        boolean involvesWorld() { return source.type == PortType.WORLD || sink.type == PortType.WORLD; }
+    }
+    private record RejectedRoute(PlannedRoute route, RejectReason reason) {}
+    private record Selection(List<PlannedRoute> selected, List<RejectedRoute> rejected) {}
 }
