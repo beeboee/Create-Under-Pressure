@@ -45,6 +45,7 @@ public final class HosePulleyWorldIOService {
     private static final int MAX_SCAN_DISTANCE = 128;
     private static final int WORLD_BLOCK_MB = 1000;
     private static final int FILLABLE_GUARD_RADIUS = 5;
+    private static final int SOURCE_SEARCH_DISTANCE = 16;
     private static final int VISUAL_LINGER_TICKS = 24;
     private static final double EPSILON = 0.01;
     private static final double DEAD_BAND = 0.05;
@@ -92,15 +93,29 @@ public final class HosePulleyWorldIOService {
         inputs.sort(Comparator.comparing(input -> input.worldPos(), HosePulleyWorldIOService::compareBlockPos));
 
         for (OpenEnd input : inputs) {
-            HoseContext ctx = context(level, ownerPipe, input);
-            FluidStack available = ctx.drainable();
-            if (available.isEmpty() || available.getAmount() < WORLD_BLOCK_MB) {
-                DebugInfo.log(level, "HOSE_IO world->tank skip input={} reason=hoseDrainWarmingOrEmpty available={} rootFluid={}",
-                        input.worldPos(), available, level.getFluidState(input.worldPos()).getType());
+            FluidState rootState = level.getFluidState(input.worldPos());
+            BlockPos drainRoot = drainRoot(level, input.worldPos());
+            if (drainRoot == null) {
+                DebugInfo.log(level, "HOSE_IO world->tank skip input={} reason=noDrainableSource rootFluid={} source=false",
+                        input.worldPos(), rootState.getType());
                 continue;
             }
 
-            double sourceHead = input.worldPos().getY() + 1.0;
+            if (isReservedAsOutput(level, scan, input)) {
+                DebugInfo.log(level, "HOSE_IO world->tank skip input={} drainRoot={} reason=reservedAsPressureOutput rootFluid={}",
+                        input.worldPos(), drainRoot, rootState.getType());
+                continue;
+            }
+
+            HoseContext ctx = context(level, ownerPipe, input, drainRoot);
+            FluidStack available = ctx.drainable();
+            if (available.isEmpty() || available.getAmount() < WORLD_BLOCK_MB) {
+                DebugInfo.log(level, "HOSE_IO world->tank skip input={} drainRoot={} reason=hoseDrainWarmingOrEmpty available={} rootFluid={}",
+                        input.worldPos(), drainRoot, available, rootState.getType());
+                continue;
+            }
+
+            double sourceHead = drainRoot.getY() + 1.0;
             List<TankContact> targets = reachableContacts(level, scan, input.pipe, sourceHead);
             targets.removeIf(target -> target.cutoffSurface() > sourceHead + EPSILON
                     || surface(target.tank) >= sourceHead - DEAD_BAND
@@ -124,8 +139,8 @@ public final class HosePulleyWorldIOService {
                 }
 
                 publishIntake(level, input, drained);
-                DebugInfo.log(level, "HOSE_IO world->tank input={} target={} moved={} stack={} sourceHead={} targetSurface={} rule=HosePulleyDrain visualEvent=true",
-                        input.worldPos(), target.tank.getController(), filled, drained, sourceHead, surface(target.tank));
+                DebugInfo.log(level, "HOSE_IO world->tank input={} drainRoot={} target={} moved={} stack={} sourceHead={} targetSurface={} rule=HosePulleyDrain visualEvent=true",
+                        input.worldPos(), drainRoot, target.tank.getController(), filled, drained, sourceHead, surface(target.tank));
                 return filled;
             }
         }
@@ -173,7 +188,7 @@ public final class HosePulleyWorldIOService {
 
                 FluidStack block = copyWithAmount(stack, WORLD_BLOCK_MB);
                 if (blocksOutput(level, outlet.worldPos(), block.getFluid())) {
-                    DebugInfo.log(level, "HOSE_IO tank->world skip source={} outlet={} reason=wetEndReservedAsInput stack={} effectiveHead={}", source.tank.getController(), outlet.worldPos(), block, effectiveHead);
+                    DebugInfo.log(level, "HOSE_IO tank->world skip source={} outlet={} reason=blockedByDifferentFluid stack={} effectiveHead={}", source.tank.getController(), outlet.worldPos(), block, effectiveHead);
                     continue;
                 }
 
@@ -232,11 +247,18 @@ public final class HosePulleyWorldIOService {
 
         for (OpenEnd input : scan.openEnds) {
             if (level.getFluidState(input.worldPos()).isEmpty()) continue;
-            HoseContext inputCtx = context(level, ownerPipe, input);
+            BlockPos drainRoot = drainRoot(level, input.worldPos());
+            if (drainRoot == null) {
+                DebugInfo.log(level, "HOSE_IO world->world skip input={} reason=noDrainableSource rootFluid={}",
+                        input.worldPos(), level.getFluidState(input.worldPos()).getType());
+                continue;
+            }
+
+            HoseContext inputCtx = context(level, ownerPipe, input, drainRoot);
             FluidStack available = inputCtx.drainable();
             if (available.isEmpty() || available.getAmount() < WORLD_BLOCK_MB) {
-                DebugInfo.log(level, "HOSE_IO world->world skip input={} reason=hoseDrainWarmingOrEmpty available={} rootFluid={}",
-                        input.worldPos(), available, level.getFluidState(input.worldPos()).getType());
+                DebugInfo.log(level, "HOSE_IO world->world skip input={} drainRoot={} reason=hoseDrainWarmingOrEmpty available={} rootFluid={}",
+                        input.worldPos(), drainRoot, available, level.getFluidState(input.worldPos()).getType());
                 continue;
             }
 
@@ -249,11 +271,11 @@ public final class HosePulleyWorldIOService {
 
             for (OpenEnd output : outputs) {
                 if (blocksOutput(level, output.worldPos(), available.getFluid())) {
-                    DebugInfo.log(level, "HOSE_IO world->world reject input={} output={} reason=wetEndReservedAsInput", input.worldPos(), output.worldPos());
+                    DebugInfo.log(level, "HOSE_IO world->world reject input={} output={} reason=blockedByDifferentFluid", input.worldPos(), output.worldPos());
                     continue;
                 }
-                if (!reachableWithinHead(level, scan, input.pipe, output.pipe, input.worldPos().getY() + 1.0)) {
-                    DebugInfo.log(level, "HOSE_IO world->world reject input={} output={} reason=pipeHumpAboveHead sourceHead={}", input.worldPos(), output.worldPos(), input.worldPos().getY() + 1.0);
+                if (!reachableWithinHead(level, scan, input.pipe, output.pipe, drainRoot.getY() + 1.0)) {
+                    DebugInfo.log(level, "HOSE_IO world->world reject input={} output={} reason=pipeHumpAboveHead sourceHead={}", input.worldPos(), output.worldPos(), drainRoot.getY() + 1.0);
                     continue;
                 }
                 HoseContext outputCtx = context(level, ownerPipe, output);
@@ -271,8 +293,8 @@ public final class HosePulleyWorldIOService {
 
                 publishIntake(level, input, drained);
                 publishOutput(level, output, drained);
-                DebugInfo.log(level, "HOSE_IO world->world input={} output={} moved={} stack={} rule=HosePulleyDrainFill visualEvent=true",
-                        input.worldPos(), output.worldPos(), filled, drained);
+                DebugInfo.log(level, "HOSE_IO world->world input={} drainRoot={} output={} moved={} stack={} rule=HosePulleyDrainFill visualEvent=true",
+                        input.worldPos(), drainRoot, output.worldPos(), filled, drained);
                 return filled;
             }
         }
@@ -282,9 +304,46 @@ public final class HosePulleyWorldIOService {
 
     private static boolean blocksOutput(Level level, BlockPos pos, Fluid fluid) {
         FluidState state = level.getFluidState(pos);
-        if (state.isEmpty()) return false;
-        if (!state.getType().isSame(fluid)) return true;
-        return state.isSource();
+        return !state.isEmpty() && !state.getType().isSame(fluid);
+    }
+
+    private static boolean isReservedAsOutput(Level level, Scan scan, OpenEnd end) {
+        double endHead = end.worldPos().getY();
+        for (TankContact contact : scan.contacts) {
+            if (!canProvide(contact)) continue;
+            double head = propagatedHead(level, scan, contact.pipe, surface(contact.tank));
+            if (head <= endHead + DEAD_BAND) continue;
+            if (reachableWithinHead(level, scan, contact.pipe, end.pipe, head)) return true;
+        }
+        return false;
+    }
+
+    private static BlockPos drainRoot(Level level, BlockPos root) {
+        FluidState state = level.getFluidState(root);
+        if (state.isEmpty()) return null;
+        if (state.isSource()) return root;
+
+        Fluid fluid = state.getType();
+        Set<BlockPos> visited = new HashSet<>();
+        ArrayDeque<Node> queue = new ArrayDeque<>();
+        queue.add(new Node(root, 0));
+        visited.add(root);
+
+        while (!queue.isEmpty()) {
+            Node node = queue.removeFirst();
+            if (!level.isLoaded(node.pos)) continue;
+            FluidState nodeState = level.getFluidState(node.pos);
+            if (!nodeState.isEmpty() && nodeState.getType().isSame(fluid) && nodeState.isSource()) return node.pos;
+            if (node.distance >= SOURCE_SEARCH_DISTANCE) continue;
+            for (Direction direction : Direction.values()) {
+                BlockPos next = node.pos.relative(direction);
+                if (!visited.add(next)) continue;
+                FluidState nextState = level.getFluidState(next);
+                if (!nextState.isEmpty() && nextState.getType().isSame(fluid)) queue.add(new Node(next, node.distance + 1));
+            }
+        }
+
+        return null;
     }
 
     private static void publishIntake(Level level, OpenEnd end, FluidStack stack) {
@@ -296,9 +355,18 @@ public final class HosePulleyWorldIOService {
     }
 
     private static HoseContext context(Level level, FluidTransportBehaviour ownerPipe, OpenEnd end) {
+        return context(level, ownerPipe, end, end.worldPos());
+    }
+
+    private static HoseContext context(Level level, FluidTransportBehaviour ownerPipe, OpenEnd end, BlockPos root) {
         Map<EndKey, HoseContext> map = CONTEXTS.computeIfAbsent(level, $ -> new HashMap<>());
         EndKey key = new EndKey(end.pipe, end.face);
-        return map.computeIfAbsent(key, $ -> new HoseContext(ownerPipe, end.worldPos()));
+        HoseContext current = map.get(key);
+        if (current == null || !current.root.equals(root)) {
+            current = new HoseContext(ownerPipe, root);
+            map.put(key, current);
+        }
+        return current;
     }
 
     private static void tickContexts(Level level, Scan scan) {
