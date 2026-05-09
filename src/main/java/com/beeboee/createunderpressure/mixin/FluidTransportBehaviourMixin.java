@@ -1,6 +1,7 @@
 package com.beeboee.createunderpressure.mixin;
 
 import com.beeboee.createunderpressure.pressure.HosePulleyWorldIOService;
+import com.beeboee.createunderpressure.pressure.HydraulicPlanService;
 import com.beeboee.createunderpressure.pressure.HydraulicPlannerDebugService;
 import com.beeboee.createunderpressure.pressure.NetworkHeadBridgeService;
 import com.beeboee.createunderpressure.visual.WorldExchangeVisualLayer;
@@ -15,6 +16,7 @@ public abstract class FluidTransportBehaviourMixin {
     @Inject(method = "tick", at = @At("TAIL"), remap = false)
     private void createUnderPressure$tickPipePressure(CallbackInfo ci) {
         FluidTransportBehaviour pipe = (FluidTransportBehaviour) (Object) this;
+        HydraulicPlanService.tickPipe(pipe);
         HosePulleyWorldIOService.tickPipe(pipe);
         NetworkHeadBridgeService.tickPipe(pipe);
         HydraulicPlannerDebugService.tickPipe(pipe);
