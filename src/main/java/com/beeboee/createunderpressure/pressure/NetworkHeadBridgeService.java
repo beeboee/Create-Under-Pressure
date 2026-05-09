@@ -46,13 +46,13 @@ public final class NetworkHeadBridgeService {
         if (processed.pipes.contains(seed)) return;
 
         Scan scan = scan(level, seed);
-        if (scan.nodes.isEmpty() || scan.contacts.size() < 2) return;
+        if (scan.pipes.isEmpty() || scan.contacts.size() < 2) return;
 
-        BlockPos owner = ownerPipe(scan.nodes);
+        BlockPos owner = ownerPipe(scan.pipes);
         if (!seed.equals(owner)) return;
-        processed.pipes.addAll(scan.nodes);
+        processed.pipes.addAll(scan.pipes);
 
-        DebugInfo.beginNetwork(level, scan.nodes, owner);
+        DebugInfo.beginNetwork(level, scan.pipes, owner);
         try {
             int moved = settleWithFilledTankBridges(level, scan);
             if (moved > 0) DebugInfo.log(level, "HEAD_BRIDGE moved={}mb", moved);
@@ -72,7 +72,7 @@ public final class NetworkHeadBridgeService {
     }
 
     private static Scan scan(Level level, BlockPos seed) {
-        Set<BlockPos> nodes = new HashSet<>();
+        Set<BlockPos> pipes = new HashSet<>();
         List<TankContact> contacts = new ArrayList<>();
         ArrayDeque<Node> queue = new ArrayDeque<>();
         queue.add(new Node(seed, 0));
@@ -80,12 +80,7 @@ public final class NetworkHeadBridgeService {
         while (!queue.isEmpty()) {
             Node node = queue.removeFirst();
             if (node.distance > MAX_SCAN_DISTANCE) continue;
-            if (!level.isLoaded(node.pos) || !nodes.add(node.pos)) continue;
-
-            if (PumpHeadPressure.isPump(level, node.pos)) {
-                enqueuePumpNeighbors(level, node.pos, node.distance, queue);
-                continue;
-            }
+            if (!level.isLoaded(node.pos) || !pipes.add(node.pos)) continue;
 
             FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, node.pos);
             if (pipe == null) continue;
@@ -101,11 +96,6 @@ public final class NetworkHeadBridgeService {
                     continue;
                 }
 
-                if (PumpHeadPressure.isPump(level, other)) {
-                    queue.add(new Node(other, node.distance + 1));
-                    continue;
-                }
-
                 FluidTankBlockEntity tank = tankAt(level, other);
                 if (tank == null) continue;
 
@@ -115,28 +105,9 @@ public final class NetworkHeadBridgeService {
                     if (!tankSeed.equals(node.pos)) queue.add(new Node(tankSeed, node.distance + 1));
                 }
             }
-
-            // Some Create pump/pipe arrangements are not exposed as pipe connections
-            // until flow starts. Still treat adjacent pumps as traversable hydraulic nodes.
-            for (Direction direction : Direction.values()) {
-                BlockPos other = node.pos.relative(direction);
-                if (level.isLoaded(other) && PumpHeadPressure.isPump(level, other)) queue.add(new Node(other, node.distance + 1));
-            }
         }
 
-        return new Scan(nodes, dedupeContacts(contacts));
-    }
-
-    private static void enqueuePumpNeighbors(Level level, BlockPos pumpPos, int distance, ArrayDeque<Node> queue) {
-        Direction input = PumpHeadPressure.inputSide(level, pumpPos);
-        Direction output = PumpHeadPressure.outputSide(level, pumpPos);
-        if (input != null) enqueuePumpNeighbor(level, pumpPos.relative(input), distance, queue);
-        if (output != null) enqueuePumpNeighbor(level, pumpPos.relative(output), distance, queue);
-    }
-
-    private static void enqueuePumpNeighbor(Level level, BlockPos pos, int distance, ArrayDeque<Node> queue) {
-        if (!level.isLoaded(pos)) return;
-        if (FluidPropagator.getPipe(level, pos) != null || PumpHeadPressure.isPump(level, pos)) queue.add(new Node(pos, distance + 1));
+        return new Scan(pipes, dedupeContacts(contacts));
     }
 
     private static int settleWithFilledTankBridges(Level level, Scan scan) {
@@ -153,7 +124,7 @@ public final class NetworkHeadBridgeService {
             targets.removeIf(target -> sameTank(source.tank, target.tank)
                     || !canFillWith(target.tank, sourceFluid)
                     || surface(target.tank) >= sourceHead - DEAD_BAND
-                    || target.cutoffSurface() > boostedHeadTo(level, scan, source.pipe, target.pipe, sourceHead) + EPSILON
+                    || target.cutoffSurface() > sourceHead + EPSILON
                     || !reachableWithinHead(level, scan, source.pipe, target.pipe, sourceHead));
             targets.sort(Comparator
                     .comparingDouble((TankContact target) -> surface(target.tank))
@@ -161,12 +132,11 @@ public final class NetworkHeadBridgeService {
                     .thenComparing(target -> target.tank.getController(), NetworkHeadBridgeService::compareBlockPos));
 
             for (TankContact target : targets) {
-                double effectiveHead = boostedHeadTo(level, scan, source.pipe, target.pipe, sourceHead);
                 int sourceFloor = amountForSurface(source.tank, Math.max(source.cutoffSurface(), surface(target.tank)));
                 int available = source.tank.getTankInventory().getFluidAmount() - sourceFloor;
                 if (available <= 0) continue;
 
-                int targetMax = amountForSurface(target.tank, Math.min(effectiveHead, target.topY()));
+                int targetMax = amountForSurface(target.tank, Math.min(sourceHead, target.topY()));
                 int needed = targetMax - target.tank.getTankInventory().getFluidAmount();
                 if (needed <= 0) continue;
 
@@ -174,9 +144,9 @@ public final class NetworkHeadBridgeService {
                 if (moved <= 0) continue;
 
                 DebugInfo.log(level,
-                        "HEAD_BRIDGE tank->tank source={} target={} sourcePipe={} targetPipe={} moved={} sourceSurface={} effectiveHead={} targetSurface={} sourceCutoff={} targetCutoff={}",
+                        "HEAD_BRIDGE tank->tank source={} target={} sourcePipe={} targetPipe={} moved={} sourceSurface={} targetSurface={} sourceCutoff={} targetCutoff={}",
                         source.tank.getController(), target.tank.getController(), source.pipe, target.pipe,
-                        moved, sourceHead, effectiveHead, surface(target.tank), source.cutoffSurface(), target.cutoffSurface());
+                        moved, sourceHead, surface(target.tank), source.cutoffSurface(), target.cutoffSurface());
                 return moved;
             }
         }
@@ -184,75 +154,37 @@ public final class NetworkHeadBridgeService {
         return 0;
     }
 
-    private static double boostedHeadTo(Level level, Scan scan, BlockPos startPipe, BlockPos targetPipe, double startHead) {
-        ReachResult result = reachResult(level, scan, startPipe, targetPipe, startHead);
-        return result.reachable ? result.bestHead : startHead;
-    }
-
     private static boolean reachableWithinHead(Level level, Scan scan, BlockPos startPipe, BlockPos targetPipe, double maxHead) {
-        return reachResult(level, scan, startPipe, targetPipe, maxHead).reachable;
-    }
-
-    private static ReachResult reachResult(Level level, Scan scan, BlockPos startPipe, BlockPos targetPipe, double startHead) {
-        Map<BlockPos, Double> bestHead = new HashMap<>();
-        ArrayDeque<PathNode> queue = new ArrayDeque<>();
-        queue.add(new PathNode(startPipe, null, startHead));
-        bestHead.put(startPipe, startHead);
+        Set<BlockPos> visited = new HashSet<>();
+        ArrayDeque<BlockPos> queue = new ArrayDeque<>();
+        queue.add(startPipe);
+        visited.add(startPipe);
 
         while (!queue.isEmpty()) {
-            PathNode current = queue.removeFirst();
-            if (current.pos.equals(targetPipe)) return new ReachResult(true, current.head);
+            BlockPos pipePos = queue.removeFirst();
+            if (pipePos.equals(targetPipe)) return true;
 
-            if (PumpHeadPressure.isPump(level, current.pos)) {
-                Direction input = PumpHeadPressure.inputSide(level, current.pos);
-                Direction output = PumpHeadPressure.outputSide(level, current.pos);
-                if (input != null) enqueueReach(level, scan, queue, bestHead, current, current.pos.relative(input), targetPipe);
-                if (output != null) enqueueReach(level, scan, queue, bestHead, current, current.pos.relative(output), targetPipe);
-                continue;
-            }
-
-            FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, current.pos);
+            FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, pipePos);
             if (pipe != null) {
-                for (Direction face : FluidPropagator.getPipeConnections(level.getBlockState(current.pos), pipe)) {
-                    enqueueReach(level, scan, queue, bestHead, current, current.pos.relative(face), targetPipe);
-                }
-
-                for (Direction direction : Direction.values()) {
-                    BlockPos pumpPos = current.pos.relative(direction);
-                    if (scan.nodes.contains(pumpPos) && PumpHeadPressure.isPump(level, pumpPos)) {
-                        enqueueReach(level, scan, queue, bestHead, current, pumpPos, targetPipe);
-                    }
+                for (Direction face : FluidPropagator.getPipeConnections(level.getBlockState(pipePos), pipe)) {
+                    BlockPos next = pipePos.relative(face);
+                    if (!scan.pipes.contains(next) || next.getY() > maxHead + EPSILON || !visited.add(next)) continue;
+                    queue.add(next);
                 }
             }
 
             for (TankContact entry : scan.contacts) {
-                if (!entry.pipe.equals(current.pos) || !canBridgeAtHead(entry, current.head)) continue;
+                if (!entry.pipe.equals(pipePos) || !canBridgeAtHead(entry, maxHead)) continue;
                 for (TankContact exit : scan.contacts) {
-                    if (!sameTank(entry.tank, exit.tank) || exit.pipe.equals(current.pos) || !canBridgeAtHead(exit, current.head)) continue;
-                    if (exit.pipe.getY() > current.head + EPSILON) continue;
-                    enqueueReach(level, scan, queue, bestHead, current, exit.pipe, targetPipe);
+                    if (!sameTank(entry.tank, exit.tank) || exit.pipe.equals(pipePos) || !canBridgeAtHead(exit, maxHead)) continue;
+                    if (exit.pipe.getY() > maxHead + EPSILON || !visited.add(exit.pipe)) continue;
+                    queue.add(exit.pipe);
                     DebugInfo.log(level, "HEAD_BRIDGE path through tank={} fromPipe={} toPipe={} maxHead={} tankSurface={} entryCutoff={} exitCutoff={}",
-                            entry.tank.getController(), entry.pipe, exit.pipe, current.head, surface(entry.tank), entry.cutoffSurface(), exit.cutoffSurface());
+                            entry.tank.getController(), entry.pipe, exit.pipe, maxHead, surface(entry.tank), entry.cutoffSurface(), exit.cutoffSurface());
                 }
             }
         }
-        return new ReachResult(false, startHead);
-    }
-
-    private static void enqueueReach(Level level, Scan scan, ArrayDeque<PathNode> queue, Map<BlockPos, Double> bestHead, PathNode current, BlockPos next, BlockPos targetPipe) {
-        if (!level.isLoaded(next)) return;
-        if (!scan.nodes.contains(next) && !next.equals(targetPipe)) return;
-
-        double nextHead = current.head;
-        if (PumpHeadPressure.isPump(level, current.pos) && current.previous != null) {
-            nextHead += PumpHeadPressure.upstreamBoostForCrossing(level, current.previous, current.pos, next);
-        }
-
-        if (next.getY() > nextHead + EPSILON) return;
-        Double previousBest = bestHead.get(next);
-        if (previousBest != null && previousBest >= nextHead - EPSILON) return;
-        bestHead.put(next, nextHead);
-        queue.add(new PathNode(next, current.pos, nextHead));
+        return false;
     }
 
     private static boolean canBridgeAtHead(TankContact contact, double maxHead) {
@@ -350,14 +282,9 @@ public final class NetworkHeadBridgeService {
         return new ArrayList<>(deduped.values());
     }
 
-    private static BlockPos ownerPipe(Set<BlockPos> nodes) {
+    private static BlockPos ownerPipe(Set<BlockPos> pipes) {
         BlockPos owner = null;
-        for (BlockPos node : nodes) {
-            if (FluidPropagator.getPipe(null, node) == null) continue;
-            if (owner == null || compareBlockPos(node, owner) < 0) owner = node;
-        }
-        if (owner != null) return owner;
-        for (BlockPos node : nodes) if (owner == null || compareBlockPos(node, owner) < 0) owner = node;
+        for (BlockPos pipe : pipes) if (owner == null || compareBlockPos(pipe, owner) < 0) owner = pipe;
         return owner;
     }
 
@@ -369,9 +296,7 @@ public final class NetworkHeadBridgeService {
 
     private record ProcessedTick(long gameTime, Set<BlockPos> pipes) {}
     private record Node(BlockPos pos, int distance) {}
-    private record PathNode(BlockPos pos, BlockPos previous, double head) {}
-    private record ReachResult(boolean reachable, double bestHead) {}
-    private record Scan(Set<BlockPos> nodes, List<TankContact> contacts) {}
+    private record Scan(Set<BlockPos> pipes, List<TankContact> contacts) {}
     private record TankContact(FluidTankBlockEntity tank, BlockPos pipe, Direction face) {
         double cutoffSurface() { return NetworkHeadBridgeService.cutoffSurface(pipe, face, tank); }
         double topY() { return tank.getController().getY() + tank.getHeight(); }
