@@ -102,7 +102,9 @@ public final class HosePulleyWorldIOService {
 
             double sourceHead = input.worldPos().getY() + 1.0;
             List<TankContact> targets = reachableContacts(level, scan, input.pipe, sourceHead);
-            targets.removeIf(target -> target.cutoffSurface() > sourceHead + EPSILON || !canFillWith(target.tank, available));
+            targets.removeIf(target -> target.cutoffSurface() > sourceHead + EPSILON
+                    || surface(target.tank) >= sourceHead - DEAD_BAND
+                    || !canFillWith(target.tank, available));
             targets.sort(Comparator
                     .comparingDouble((TankContact target) -> surface(target.tank))
                     .thenComparingInt(target -> target.pipe.distManhattan(input.pipe)));
@@ -122,8 +124,8 @@ public final class HosePulleyWorldIOService {
                 }
 
                 publishIntake(level, input, drained);
-                DebugInfo.log(level, "HOSE_IO world->tank input={} target={} moved={} stack={} rule=HosePulleyDrain visualEvent=true",
-                        input.worldPos(), target.tank.getController(), filled, drained);
+                DebugInfo.log(level, "HOSE_IO world->tank input={} target={} moved={} stack={} sourceHead={} targetSurface={} rule=HosePulleyDrain visualEvent=true",
+                        input.worldPos(), target.tank.getController(), filled, drained, sourceHead, surface(target.tank));
                 return filled;
             }
         }
@@ -142,44 +144,46 @@ public final class HosePulleyWorldIOService {
         for (OpenEnd outlet : outlets) {
             double outletHead = outlet.worldPos().getY();
             List<TankContact> sources = reachableContacts(level, scan, outlet.pipe, 256.0);
-            sources.removeIf(source -> !canProvide(source) || surface(source.tank) <= outletHead + DEAD_BAND);
+            sources.removeIf(source -> !canProvide(source) || propagatedHead(level, scan, source.pipe, surface(source.tank)) <= outletHead + DEAD_BAND);
             sources.sort(Comparator
-                    .comparingDouble((TankContact source) -> surface(source.tank)).reversed()
+                    .comparingDouble((TankContact source) -> propagatedHead(level, scan, source.pipe, surface(source.tank))).reversed()
+                    .thenComparingDouble(source -> surface(source.tank)).reversed()
                     .thenComparingInt(source -> source.pipe.distManhattan(outlet.pipe)));
 
             for (TankContact source : sources) {
                 FluidStack stack = source.tank.getTankInventory().getFluid();
                 if (stack.isEmpty()) continue;
                 double sourceSurface = surface(source.tank);
-                if (!reachableWithinHead(level, scan, source.pipe, outlet.pipe, sourceSurface)) continue;
+                double effectiveHead = propagatedHead(level, scan, source.pipe, sourceSurface);
+                if (!reachableWithinHead(level, scan, source.pipe, outlet.pipe, effectiveHead)) continue;
 
-                TankContact tankFirst = tankNeedsFillBeforeWorld(level, scan, source, outlet, stack);
+                TankContact tankFirst = tankNeedsFillBeforeWorld(level, scan, source, outlet, stack, effectiveHead);
                 if (tankFirst != null) {
-                    DebugInfo.log(level, "HOSE_IO tank->world defer source={} outlet={} reason=tankBeforeWorld target={} targetSurface={} targetCutoff={} outletHead={}",
-                            source.tank.getController(), outlet.worldPos(), tankFirst.tank.getController(), surface(tankFirst.tank), tankFirst.cutoffSurface(), outletHead);
+                    DebugInfo.log(level, "HOSE_IO tank->world defer source={} outlet={} reason=tankBeforeWorld target={} targetSurface={} targetCutoff={} outletHead={} effectiveHead={}",
+                            source.tank.getController(), outlet.worldPos(), tankFirst.tank.getController(), surface(tankFirst.tank), tankFirst.cutoffSurface(), outletHead, effectiveHead);
                     continue;
                 }
 
                 int floor = amountForSurface(source.tank, source.cutoffSurface());
                 int available = source.tank.getTankInventory().getFluidAmount() - floor;
                 if (available < WORLD_BLOCK_MB) {
-                    DebugInfo.log(level, "HOSE_IO tank->world skip source={} outlet={} reason=availableBelow1000 available={}", source.tank.getController(), outlet.worldPos(), available);
+                    DebugInfo.log(level, "HOSE_IO tank->world skip source={} outlet={} reason=availableBelow1000 available={} effectiveHead={}", source.tank.getController(), outlet.worldPos(), available, effectiveHead);
                     continue;
                 }
 
                 FluidStack block = copyWithAmount(stack, WORLD_BLOCK_MB);
                 if (blocksOutput(level, outlet.worldPos(), block.getFluid())) {
-                    DebugInfo.log(level, "HOSE_IO tank->world skip source={} outlet={} reason=wetEndReservedAsInput stack={}", source.tank.getController(), outlet.worldPos(), block);
+                    DebugInfo.log(level, "HOSE_IO tank->world skip source={} outlet={} reason=wetEndReservedAsInput stack={} effectiveHead={}", source.tank.getController(), outlet.worldPos(), block, effectiveHead);
                     continue;
                 }
 
                 HoseContext ctx = context(level, ownerPipe, outlet);
                 if (!hasLikelyFillableSpace(level, outlet.worldPos(), block.getFluid())) {
-                    DebugInfo.log(level, "HOSE_IO tank->world skip source={} outlet={} reason=noNearbyFillableSpace stack={}", source.tank.getController(), outlet.worldPos(), block);
+                    DebugInfo.log(level, "HOSE_IO tank->world skip source={} outlet={} reason=noNearbyFillableSpace stack={} effectiveHead={}", source.tank.getController(), outlet.worldPos(), block, effectiveHead);
                     continue;
                 }
                 if (!ctx.canDeposit(block.getFluid())) {
-                    DebugInfo.log(level, "HOSE_IO tank->world skip source={} outlet={} reason=hoseFillWarmingOrRejected stack={}", source.tank.getController(), outlet.worldPos(), block);
+                    DebugInfo.log(level, "HOSE_IO tank->world skip source={} outlet={} reason=hoseFillWarmingOrRejected stack={} effectiveHead={}", source.tank.getController(), outlet.worldPos(), block, effectiveHead);
                     continue;
                 }
 
@@ -188,13 +192,13 @@ public final class HosePulleyWorldIOService {
                 int filled = ctx.handler.fill(drained, FluidAction.EXECUTE);
                 if (filled < WORLD_BLOCK_MB) {
                     source.tank.getTankInventory().fill(drained, FluidAction.EXECUTE);
-                    DebugInfo.log(level, "HOSE_IO tank->world rollback source={} outlet={} filled={}", source.tank.getController(), outlet.worldPos(), filled);
+                    DebugInfo.log(level, "HOSE_IO tank->world rollback source={} outlet={} filled={} effectiveHead={}", source.tank.getController(), outlet.worldPos(), filled, effectiveHead);
                     continue;
                 }
 
                 publishOutput(level, outlet, drained);
-                DebugInfo.log(level, "HOSE_IO tank->world source={} outlet={} moved={} stack={} rule=HosePulleyFill visualEvent=true",
-                        source.tank.getController(), outlet.worldPos(), filled, drained);
+                DebugInfo.log(level, "HOSE_IO tank->world source={} outlet={} moved={} stack={} sourceSurface={} effectiveHead={} rule=HosePulleyFill visualEvent=true",
+                        source.tank.getController(), outlet.worldPos(), filled, drained, sourceSurface, effectiveHead);
                 return filled;
             }
         }
@@ -202,14 +206,15 @@ public final class HosePulleyWorldIOService {
         return 0;
     }
 
-    private static TankContact tankNeedsFillBeforeWorld(Level level, Scan scan, TankContact source, OpenEnd outlet, FluidStack stack) {
+    private static TankContact tankNeedsFillBeforeWorld(Level level, Scan scan, TankContact source, OpenEnd outlet, FluidStack stack, double effectiveHead) {
         double sourceSurface = surface(source.tank);
         double outletHead = outlet.worldPos().getY();
         return scan.contacts.stream()
                 .filter(target -> !sameTank(source.tank, target.tank))
                 .filter(target -> canFillWith(target.tank, stack))
-                .filter(target -> target.cutoffSurface() <= sourceSurface + EPSILON)
-                .filter(target -> reachableWithinHead(level, scan, source.pipe, target.pipe, sourceSurface))
+                .filter(target -> surface(target.tank) < sourceSurface - DEAD_BAND)
+                .filter(target -> target.cutoffSurface() <= effectiveHead + EPSILON)
+                .filter(target -> reachableWithinHead(level, scan, source.pipe, target.pipe, effectiveHead))
                 .filter(target -> {
                     double fillTo = Math.min(target.topY(), Math.max(target.cutoffSurface() + PRE_WORLD_TANK_FILL_DEPTH, outletHead + 1.0));
                     return fillTo > target.tank.getController().getY() + EPSILON
@@ -350,6 +355,17 @@ public final class HosePulleyWorldIOService {
         return reachable;
     }
 
+    private static double propagatedHead(Level level, Scan scan, BlockPos pipePos, double localHead) {
+        double head = localHead;
+        for (TankContact contact : scan.contacts) {
+            double contactHead = surface(contact.tank);
+            if (contactHead <= head + DEAD_BAND) continue;
+            if (!canProvide(contact)) continue;
+            if (reachableWithinHead(level, scan, contact.pipe, pipePos, contactHead)) head = Math.max(head, contactHead);
+        }
+        return head;
+    }
+
     private static boolean reachableWithinHead(Level level, Scan scan, BlockPos startPipe, BlockPos targetPipe, double maxHead) {
         Set<BlockPos> visited = new HashSet<>();
         ArrayDeque<BlockPos> queue = new ArrayDeque<>();
@@ -358,15 +374,33 @@ public final class HosePulleyWorldIOService {
         while (!queue.isEmpty()) {
             BlockPos pipePos = queue.removeFirst();
             if (pipePos.equals(targetPipe)) return true;
+
             FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, pipePos);
-            if (pipe == null) continue;
-            for (Direction face : FluidPropagator.getPipeConnections(level.getBlockState(pipePos), pipe)) {
-                BlockPos next = pipePos.relative(face);
-                if (!scan.pipes.contains(next) || !visited.add(next) || next.getY() > maxHead + EPSILON) continue;
-                queue.add(next);
+            if (pipe != null) {
+                for (Direction face : FluidPropagator.getPipeConnections(level.getBlockState(pipePos), pipe)) {
+                    BlockPos next = pipePos.relative(face);
+                    if (!scan.pipes.contains(next) || !visited.add(next) || next.getY() > maxHead + EPSILON) continue;
+                    queue.add(next);
+                }
+            }
+
+            for (TankContact entry : scan.contacts) {
+                if (!entry.pipe.equals(pipePos) || !canBridgeAtHead(entry, maxHead)) continue;
+                for (TankContact exit : scan.contacts) {
+                    if (!sameTank(entry.tank, exit.tank) || exit.pipe.equals(pipePos) || !canBridgeAtHead(exit, maxHead)) continue;
+                    if (exit.pipe.getY() > maxHead + EPSILON || !visited.add(exit.pipe)) continue;
+                    queue.add(exit.pipe);
+                    DebugInfo.log(level, "HOSE_IO path through tank={} fromPipe={} toPipe={} maxHead={} tankSurface={} entryCutoff={} exitCutoff={}",
+                            entry.tank.getController(), entry.pipe, exit.pipe, maxHead, surface(entry.tank), entry.cutoffSurface(), exit.cutoffSurface());
+                }
             }
         }
         return false;
+    }
+
+    private static boolean canBridgeAtHead(TankContact contact, double maxHead) {
+        return contact.cutoffSurface() <= maxHead + EPSILON
+                && surface(contact.tank) > contact.cutoffSurface() + EPSILON;
     }
 
     private static boolean hasLikelyFillableSpace(Level level, BlockPos root, Fluid fluid) {
