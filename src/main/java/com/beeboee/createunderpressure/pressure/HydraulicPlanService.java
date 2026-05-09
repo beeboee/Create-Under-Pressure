@@ -29,7 +29,7 @@ public final class HydraulicPlanService {
         ProcessedTick processed = processed(level);
         if (processed.pipes.contains(seed)) return;
 
-        HydraulicPlanBuilder.BuildResult result = HydraulicPlanBuilder.build(level, seed, HydraulicPlanRuntime.lastSelectedRouteKeys(level, seed));
+        HydraulicPlanBuilder.BuildResult result = HydraulicPlanRuntime.acquire(level, seed, level.getGameTime());
         HydraulicPlan plan = result.plan();
         if (result.pipes().isEmpty()) return;
 
@@ -37,7 +37,6 @@ public final class HydraulicPlanService {
         if (!seed.equals(owner)) return;
 
         processed.pipes.addAll(result.pipes());
-        HydraulicPlanRuntime.remember(level, result, level.getGameTime());
     }
 
     private static ProcessedTick processed(Level level) {
