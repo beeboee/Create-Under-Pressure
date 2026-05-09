@@ -40,12 +40,13 @@ public final class HosePulleyWorldIOService {
     private HosePulleyWorldIOService() {}
 
     private static final int TICK_INTERVAL = 8;
-    private static final int PREPARE_TICKS = 16;
+    private static final int PREPARE_TICKS = 96;
     private static final int MAX_SCAN_DISTANCE = 128;
     private static final int WORLD_BLOCK_MB = 1000;
     private static final int FILLABLE_GUARD_RADIUS = 5;
     private static final double EPSILON = 0.01;
     private static final double DEAD_BAND = 0.05;
+    private static final double PRE_WORLD_TANK_FILL_DEPTH = 0.5;
     private static final float VISUAL_PRESSURE = 64.0f;
 
     private static final Map<Level, ProcessedTick> PROCESSED = new WeakHashMap<>();
@@ -150,7 +151,15 @@ public final class HosePulleyWorldIOService {
             for (TankContact source : sources) {
                 FluidStack stack = source.tank.getTankInventory().getFluid();
                 if (stack.isEmpty()) continue;
-                if (!reachableWithinHead(level, scan, source.pipe, outlet.pipe, surface(source.tank))) continue;
+                double sourceSurface = surface(source.tank);
+                if (!reachableWithinHead(level, scan, source.pipe, outlet.pipe, sourceSurface)) continue;
+
+                TankContact tankFirst = tankNeedsFillBeforeWorld(level, scan, source, outlet, stack);
+                if (tankFirst != null) {
+                    DebugInfo.log(level, "HOSE_IO tank->world defer source={} outlet={} reason=tankBeforeWorld target={} targetSurface={} targetCutoff={} outletHead={}",
+                            source.tank.getController(), outlet.worldPos(), tankFirst.tank.getController(), surface(tankFirst.tank), tankFirst.cutoffSurface(), outletHead);
+                    continue;
+                }
 
                 int floor = amountForSurface(source.tank, source.cutoffSurface());
                 int available = source.tank.getTankInventory().getFluidAmount() - floor;
@@ -188,13 +197,39 @@ public final class HosePulleyWorldIOService {
         return 0;
     }
 
+    private static TankContact tankNeedsFillBeforeWorld(Level level, Scan scan, TankContact source, OpenEnd outlet, FluidStack stack) {
+        double sourceSurface = surface(source.tank);
+        double outletHead = outlet.worldPos().getY();
+        return scan.contacts.stream()
+                .filter(target -> !sameTank(source.tank, target.tank))
+                .filter(target -> canFillWith(target.tank, stack))
+                .filter(target -> target.cutoffSurface() <= sourceSurface + EPSILON)
+                .filter(target -> reachableWithinHead(level, scan, source.pipe, target.pipe, sourceSurface))
+                .filter(target -> {
+                    double fillTo = Math.min(target.topY(), Math.max(target.cutoffSurface() + PRE_WORLD_TANK_FILL_DEPTH, outletHead + 1.0));
+                    return fillTo > target.tank.getController().getY() + EPSILON
+                            && surface(target.tank) < fillTo - DEAD_BAND
+                            && target.tank.getTankInventory().getFluidAmount() < amountForSurface(target.tank, fillTo);
+                })
+                .min(Comparator
+                        .comparingDouble((TankContact target) -> surface(target.tank))
+                        .thenComparingInt(target -> target.pipe.distManhattan(source.pipe)))
+                .orElse(null);
+    }
+
     private static int worldToWorld(Level level, FluidTransportBehaviour ownerPipe, Scan scan) {
         if (!scan.contacts.isEmpty() || scan.openEnds.size() < 2) return 0;
 
         for (OpenEnd input : scan.openEnds) {
             HoseContext inputCtx = context(level, ownerPipe, input);
             FluidStack available = inputCtx.drainable();
-            if (available.isEmpty() || available.getAmount() < WORLD_BLOCK_MB) continue;
+            if (available.isEmpty() || available.getAmount() < WORLD_BLOCK_MB) {
+                if (!level.getFluidState(input.worldPos()).isEmpty()) {
+                    DebugInfo.log(level, "HOSE_IO world->world skip input={} reason=hoseDrainWarmingOrEmpty available={} rootFluid={}",
+                            input.worldPos(), available, level.getFluidState(input.worldPos()).getType());
+                }
+                continue;
+            }
 
             List<OpenEnd> outputs = new ArrayList<>(scan.openEnds);
             outputs.remove(input);
@@ -204,7 +239,10 @@ public final class HosePulleyWorldIOService {
                     .thenComparingInt(output -> output.pipe.distManhattan(input.pipe)));
 
             for (OpenEnd output : outputs) {
-                if (!reachableWithinHead(level, scan, input.pipe, output.pipe, input.worldPos().getY() + 1.0)) continue;
+                if (!reachableWithinHead(level, scan, input.pipe, output.pipe, input.worldPos().getY() + 1.0)) {
+                    DebugInfo.log(level, "HOSE_IO world->world reject input={} output={} reason=pipeHumpAboveHead sourceHead={}", input.worldPos(), output.worldPos(), input.worldPos().getY() + 1.0);
+                    continue;
+                }
                 HoseContext outputCtx = context(level, ownerPipe, output);
                 FluidStack block = copyWithAmount(available, WORLD_BLOCK_MB);
                 if (!hasLikelyFillableSpace(level, output.worldPos(), block.getFluid())) continue;
@@ -367,6 +405,10 @@ public final class HosePulleyWorldIOService {
         return stack.isEmpty() || FluidStack.isSameFluidSameComponents(stack, fluid);
     }
 
+    private static boolean sameTank(FluidTankBlockEntity a, FluidTankBlockEntity b) {
+        return a.getController().equals(b.getController());
+    }
+
     private static FluidTankBlockEntity tankAt(Level level, BlockPos pos) {
         if (!(level.getBlockEntity(pos) instanceof FluidTankBlockEntity tank)) return null;
         FluidTankBlockEntity controller = tank.isController() ? tank : tank.getControllerBE();
@@ -460,12 +502,12 @@ public final class HosePulleyWorldIOService {
             drainer = new FluidDrainingBehaviour(pipe.blockEntity);
             drainer.rebuildContext(root);
             handler = new HosePulleyFluidHandler(internalTank, filler, drainer, () -> root, () -> true);
-            prime();
+            primeDrain();
         }
 
         FluidStack drainable() {
-            prime();
-            return handler.getFluidInTank(0);
+            primeDrain();
+            return handler.drain(WORLD_BLOCK_MB, FluidAction.SIMULATE);
         }
 
         boolean canDeposit(Fluid fluid) {
@@ -476,10 +518,9 @@ public final class HosePulleyWorldIOService {
             return filler.tryDeposit(fluid, root, true);
         }
 
-        void prime() {
+        void primeDrain() {
             for (int i = 0; i < PREPARE_TICKS; i++) {
-                FluidStack stack = handler.getFluidInTank(0);
-                if (!stack.isEmpty() && stack.getAmount() >= WORLD_BLOCK_MB) return;
+                if (drainer.pullNext(root, true)) return;
                 tick();
             }
         }
@@ -496,6 +537,7 @@ public final class HosePulleyWorldIOService {
     private record Scan(Set<BlockPos> pipes, List<TankContact> contacts, List<OpenEnd> openEnds) {}
     private record TankContact(FluidTankBlockEntity tank, BlockPos pipe, Direction face) {
         double cutoffSurface() { return HosePulleyWorldIOService.cutoffSurface(pipe, face, tank); }
+        double topY() { return tank.getController().getY() + tank.getHeight(); }
     }
     private record OpenEnd(BlockPos pipe, Direction face) {
         BlockPos worldPos() { return pipe.relative(face); }
