@@ -12,8 +12,8 @@ import net.minecraft.world.level.Level;
 /**
  * Shared runtime cache for the lightweight hydraulic planner.
  *
- * This lets diagnostics, future executors, and future visual projection read the
- * same last-known plan instead of each subsystem re-inferring intent separately.
+ * This lets diagnostics, executors, and visual projection read the same
+ * last-known plan instead of each subsystem re-inferring intent separately.
  */
 public final class HydraulicPlanRuntime {
     private HydraulicPlanRuntime() {}
@@ -21,10 +21,19 @@ public final class HydraulicPlanRuntime {
     private static final Map<Level, Map<BlockPos, CachedPlan>> PLANS = new WeakHashMap<>();
     private static final Map<Level, Map<BlockPos, Set<String>>> LAST_SELECTED_ROUTES = new WeakHashMap<>();
 
+    public static HydraulicPlanBuilder.BuildResult acquire(Level level, BlockPos seed, long gameTime) {
+        CachedPlan cached = cachedContaining(level, seed, gameTime);
+        if (cached != null) return cached.result();
+
+        HydraulicPlanBuilder.BuildResult result = HydraulicPlanBuilder.build(level, seed, lastSelectedRouteKeys(level, seed));
+        remember(level, result, gameTime);
+        return result;
+    }
+
     public static void remember(Level level, HydraulicPlanBuilder.BuildResult result, long gameTime) {
         if (level == null || result == null || result.plan() == null) return;
         HydraulicPlan plan = result.plan();
-        if (plan.owner() == null) return;
+        if (plan.owner() == null || result.pipes().isEmpty()) return;
 
         PLANS.computeIfAbsent(level, $ -> new HashMap<>())
                 .put(plan.owner(), new CachedPlan(plan, result, gameTime));
@@ -85,6 +94,15 @@ public final class HydraulicPlanRuntime {
     private static CachedPlan cached(Level level, BlockPos owner) {
         Map<BlockPos, CachedPlan> levelPlans = PLANS.get(level);
         return levelPlans == null ? null : levelPlans.get(owner);
+    }
+
+    private static CachedPlan cachedContaining(Level level, BlockPos seed, long gameTime) {
+        Map<BlockPos, CachedPlan> levelPlans = PLANS.get(level);
+        if (levelPlans == null || levelPlans.isEmpty()) return null;
+        for (CachedPlan cached : levelPlans.values()) {
+            if (cached.gameTime() == gameTime && cached.result().pipes().contains(seed)) return cached;
+        }
+        return null;
     }
 
     public record CachedPlan(HydraulicPlan plan, HydraulicPlanBuilder.BuildResult result, long gameTime) {}
