@@ -1,7 +1,7 @@
 package com.beeboee.createunderpressure.pressure;
 
 import com.beeboee.createunderpressure.debug.DebugInfo;
-import com.beeboee.createunderpressure.visual.CreatePipeFlowVisualBridge;
+import com.beeboee.createunderpressure.visual.WorldExchangeVisualEvents;
 import com.simibubi.create.content.fluids.FluidPropagator;
 import com.simibubi.create.content.fluids.FluidTransportBehaviour;
 import com.simibubi.create.content.fluids.hosePulley.HosePulleyFluidHandler;
@@ -31,10 +31,11 @@ import net.neoforged.neoforge.fluids.FluidStack;
 import net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction;
 
 /**
- * Experimental replacement for our custom world fluid placement/removal.
+ * Experimental replacement for custom world fluid placement/removal.
  *
- * Tank-to-tank/head rules still live elsewhere; this service owns only world boundary
- * I/O and delegates actual block placement/removal to Create's hose pulley behaviours.
+ * This service owns world boundary I/O. It delegates real block placement/removal
+ * to Create's hose pulley behaviours, then publishes visual events for
+ * WorldExchangeVisualLayer to render centrally.
  */
 public final class HosePulleyWorldIOService {
     private HosePulleyWorldIOService() {}
@@ -44,10 +45,10 @@ public final class HosePulleyWorldIOService {
     private static final int MAX_SCAN_DISTANCE = 128;
     private static final int WORLD_BLOCK_MB = 1000;
     private static final int FILLABLE_GUARD_RADIUS = 5;
+    private static final int VISUAL_LINGER_TICKS = 24;
     private static final double EPSILON = 0.01;
     private static final double DEAD_BAND = 0.05;
     private static final double PRE_WORLD_TANK_FILL_DEPTH = 0.5;
-    private static final float VISUAL_PRESSURE = 96.0f;
 
     private static final Map<Level, ProcessedTick> PROCESSED = new WeakHashMap<>();
     private static final Map<Level, Map<EndKey, HoseContext>> CONTEXTS = new WeakHashMap<>();
@@ -73,10 +74,9 @@ public final class HosePulleyWorldIOService {
             tickContexts(level, scan);
             DebugInfo.log(level, "HOSE_IO scan owner={} pipes={} tanks={} openEnds={}", owner, scan.pipes.size(), scan.contacts.size(), scan.openEnds.size());
 
-            int moved = 0;
-            moved += worldToTank(level, pipe, scan);
-            if (moved == 0) moved += tankToWorld(level, pipe, scan);
-            if (moved == 0) moved += worldToWorld(level, pipe, scan);
+            int moved = worldToTank(level, pipe, scan);
+            if (moved == 0) moved = tankToWorld(level, pipe, scan);
+            if (moved == 0) moved = worldToWorld(level, pipe, scan);
 
             DebugInfo.log(level, "HOSE_IO result owner={} moved={}mb", owner, moved);
         } finally {
@@ -121,8 +121,8 @@ public final class HosePulleyWorldIOService {
                     ctx.handler.fill(remainder, FluidAction.EXECUTE);
                 }
 
-                showIntake(level, input, drained);
-                DebugInfo.log(level, "HOSE_IO world->tank input={} target={} moved={} stack={} rule=HosePulleyDrain",
+                publishIntake(level, input, drained);
+                DebugInfo.log(level, "HOSE_IO world->tank input={} target={} moved={} stack={} rule=HosePulleyDrain visualEvent=true",
                         input.worldPos(), target.tank.getController(), filled, drained);
                 return filled;
             }
@@ -192,8 +192,8 @@ public final class HosePulleyWorldIOService {
                     continue;
                 }
 
-                showOutput(level, outlet, drained);
-                DebugInfo.log(level, "HOSE_IO tank->world source={} outlet={} moved={} stack={} rule=HosePulleyFill",
+                publishOutput(level, outlet, drained);
+                DebugInfo.log(level, "HOSE_IO tank->world source={} outlet={} moved={} stack={} rule=HosePulleyFill visualEvent=true",
                         source.tank.getController(), outlet.worldPos(), filled, drained);
                 return filled;
             }
@@ -264,9 +264,9 @@ public final class HosePulleyWorldIOService {
                     continue;
                 }
 
-                showIntake(level, input, drained);
-                showOutput(level, output, drained);
-                DebugInfo.log(level, "HOSE_IO world->world input={} output={} moved={} stack={} rule=HosePulleyDrainFill",
+                publishIntake(level, input, drained);
+                publishOutput(level, output, drained);
+                DebugInfo.log(level, "HOSE_IO world->world input={} output={} moved={} stack={} rule=HosePulleyDrainFill visualEvent=true",
                         input.worldPos(), output.worldPos(), filled, drained);
                 return filled;
             }
@@ -282,6 +282,14 @@ public final class HosePulleyWorldIOService {
         return state.isSource();
     }
 
+    private static void publishIntake(Level level, OpenEnd end, FluidStack stack) {
+        WorldExchangeVisualEvents.publish(level, end.pipe, end.face, WorldExchangeVisualEvents.Action.INTAKE, stack, VISUAL_LINGER_TICKS);
+    }
+
+    private static void publishOutput(Level level, OpenEnd end, FluidStack stack) {
+        WorldExchangeVisualEvents.publish(level, end.pipe, end.face, WorldExchangeVisualEvents.Action.OUTPUT, stack, VISUAL_LINGER_TICKS);
+    }
+
     private static HoseContext context(Level level, FluidTransportBehaviour ownerPipe, OpenEnd end) {
         Map<EndKey, HoseContext> map = CONTEXTS.computeIfAbsent(level, $ -> new HashMap<>());
         EndKey key = new EndKey(end.pipe, end.face);
@@ -295,16 +303,6 @@ public final class HosePulleyWorldIOService {
         for (OpenEnd end : scan.openEnds) active.add(new EndKey(end.pipe, end.face));
         map.entrySet().removeIf(entry -> !active.contains(entry.getKey()));
         for (HoseContext ctx : map.values()) ctx.tick();
-    }
-
-    private static void showIntake(Level level, OpenEnd end, FluidStack stack) {
-        CreateWorldEndIO.spawnCreateParticles(level, end.pipe, end.face, stack, true);
-        CreatePipeFlowVisualBridge.apply(level, FluidPropagator.getPipe(level, end.pipe), end.pipe, end.face, true, VISUAL_PRESSURE);
-    }
-
-    private static void showOutput(Level level, OpenEnd end, FluidStack stack) {
-        CreateWorldEndIO.spawnCreateParticles(level, end.pipe, end.face, stack, false);
-        CreatePipeFlowVisualBridge.apply(level, FluidPropagator.getPipe(level, end.pipe), end.pipe, end.face, false, VISUAL_PRESSURE);
     }
 
     private static Scan scan(Level level, BlockPos seed) {
@@ -382,7 +380,7 @@ public final class HosePulleyWorldIOService {
             if (!level.isLoaded(node.pos)) continue;
             BlockState state = level.getBlockState(node.pos);
             FluidState fluidState = state.getFluidState();
-            if (isLikelyFillable(level, node.pos, state, fluidState, fluid)) return true;
+            if (isLikelyFillable(state, fluidState, fluid)) return true;
             if (node.distance >= FILLABLE_GUARD_RADIUS) continue;
             for (Direction direction : new Direction[] {Direction.DOWN, Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST}) {
                 BlockPos next = node.pos.relative(direction);
@@ -393,7 +391,7 @@ public final class HosePulleyWorldIOService {
         return false;
     }
 
-    private static boolean isLikelyFillable(Level level, BlockPos pos, BlockState state, FluidState fluidState, Fluid fluid) {
+    private static boolean isLikelyFillable(BlockState state, FluidState fluidState, Fluid fluid) {
         if (state.hasProperty(BlockStateProperties.WATERLOGGED)) {
             return fluid.isSame(Fluids.WATER) && !state.getValue(BlockStateProperties.WATERLOGGED);
         }
