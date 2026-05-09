@@ -3,18 +3,17 @@ package com.beeboee.createunderpressure.pressure;
 import com.beeboee.createunderpressure.debug.DebugInfo;
 import com.simibubi.create.content.fluids.FluidTransportBehaviour;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
-import java.util.Map;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 
 /**
  * Diagnostic projection for the shared hydraulic planner core.
  *
- * This intentionally does not move fluid. It asks HydraulicPlanBuilder for the
- * same plan object that executor/visual code can consume later, stores it in
- * HydraulicPlanRuntime, then logs it.
+ * This intentionally does not move fluid. It reads the same runtime-acquired
+ * plan object used by executors and visual code, then logs it.
  */
 public final class HydraulicPlannerDebugService {
     private HydraulicPlannerDebugService() {}
@@ -34,14 +33,13 @@ public final class HydraulicPlannerDebugService {
         ProcessedTick processed = processed(level);
         if (processed.pipes.contains(seed)) return;
 
-        HydraulicPlanBuilder.BuildResult result = HydraulicPlanBuilder.build(level, seed, HydraulicPlanRuntime.lastSelectedRouteKeys(level, seed));
+        HydraulicPlanBuilder.BuildResult result = HydraulicPlanRuntime.acquire(level, seed, level.getGameTime());
         HydraulicPlan plan = result.plan();
         if (result.pipes().isEmpty()) return;
 
         BlockPos owner = plan.owner();
         if (!seed.equals(owner)) return;
         processed.pipes.addAll(result.pipes());
-        HydraulicPlanRuntime.remember(level, result, level.getGameTime());
 
         DebugInfo.beginNetwork(level, result.pipes(), owner);
         try {
