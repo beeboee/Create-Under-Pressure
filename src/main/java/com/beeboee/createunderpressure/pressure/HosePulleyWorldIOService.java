@@ -45,7 +45,7 @@ public final class HosePulleyWorldIOService {
     private static final int MAX_SCAN_DISTANCE = 128;
     private static final int WORLD_BLOCK_MB = 1000;
     private static final int FILLABLE_GUARD_RADIUS = 5;
-    private static final int SOURCE_SEARCH_DISTANCE = 16;
+    private static final int SOURCE_SEARCH_DISTANCE = 6;
     private static final int VISUAL_LINGER_TICKS = 24;
     private static final double EPSILON = 0.01;
     private static final double DEAD_BAND = 0.05;
