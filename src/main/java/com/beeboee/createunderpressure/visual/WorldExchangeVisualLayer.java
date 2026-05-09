@@ -25,8 +25,8 @@ import net.neoforged.neoforge.fluids.FluidStack;
 /**
  * Cosmetic-only world exchange effects for open pipe ends.
  *
- * This layer follows NetworkPressurePlanner's planned actions, but delegates the actual
- * open-end particle style and pipe flow/fullness hints to Create's own helpers.
+ * This layer follows planner visuals plus shared simulation events, then delegates
+ * particles and Create pipe flow/fullness hints to Create's helpers.
  */
 public final class WorldExchangeVisualLayer {
     private WorldExchangeVisualLayer() {}
@@ -35,7 +35,7 @@ public final class WorldExchangeVisualLayer {
     private static final int MAX_SCAN_DISTANCE = 48;
     private static final int WORLD_BLOCK_MB = 1000;
     private static final int LINGER_TICKS = 16;
-    private static final float CREATE_FLOW_PRESSURE = 64.0f;
+    private static final float CREATE_FLOW_PRESSURE = 96.0f;
     private static final float PASSIVE_FULLNESS_PRESSURE = 16.0f;
     private static final double EPSILON = 0.01;
 
@@ -53,6 +53,7 @@ public final class WorldExchangeVisualLayer {
         BlockPos owner = ownerPipe(scan.pipes);
         if (!seed.equals(owner)) return;
 
+        WorldExchangeVisualEvents.prune(level);
         logAndSpawnPlannedVisuals(level, scan, owner);
     }
 
@@ -61,6 +62,7 @@ public final class WorldExchangeVisualLayer {
         if (debug) DebugInfo.beginNetwork(level, scan.pipes, owner);
         try {
             int livePlanned = 0;
+            int eventPlanned = 0;
             int lingered = 0;
             int skipped = 0;
             FluidStack networkVisualFluid = networkVisualFluid(level, scan);
@@ -69,9 +71,23 @@ public final class WorldExchangeVisualLayer {
 
             for (OpenEnd end : scan.openEnds) {
                 NetworkPressurePlanner.PlannedVisual action = NetworkPressurePlanner.visualFor(level, end.pipe, end.face);
+                WorldExchangeVisualEvents.VisualEvent event = WorldExchangeVisualEvents.visualFor(level, end.pipe, end.face);
+                FluidStack eventFluid = event == null ? FluidStack.EMPTY : event.fluid();
+                String visualSource = "planner";
                 boolean live = action != null;
-                if (live) rememberVisual(level, end, action);
-                else action = lingeringVisual(level, end);
+
+                if (live) {
+                    rememberVisual(level, end, action);
+                    livePlanned++;
+                } else if (event != null) {
+                    action = toPlannerVisual(event.action());
+                    visualSource = "event";
+                    eventPlanned++;
+                } else {
+                    action = lingeringVisual(level, end);
+                    visualSource = "linger";
+                    if (action != null) lingered++;
+                }
 
                 BlockPos worldPos = end.worldPos();
                 if (action == null) {
@@ -80,30 +96,33 @@ public final class WorldExchangeVisualLayer {
                     continue;
                 }
 
-                if (live) livePlanned++;
-                else lingered++;
-
                 activeFaces.add(new VisualKey(end.pipe, end.face));
                 plannedEnds.add(new PlannedEnd(end, action));
-                FluidStack visualFluid = visualFluid(level, end, action, networkVisualFluid);
+                FluidStack visualFluid = visualFluid(level, end, action, networkVisualFluid, eventFluid);
                 boolean splashOnRim = action == NetworkPressurePlanner.PlannedVisual.INTAKE;
                 CreateWorldEndIO.spawnCreateParticles(level, end.pipe, end.face, visualFluid, splashOnRim);
                 applyCreateFlowHint(level, end, action);
 
                 if (debug) {
                     FluidState fluidState = level.getFluidState(worldPos);
-                    DebugInfo.log(level, "VISUAL planned pipe={} face={} pos={} action={} live={} fluid={} source={} visualFluid={} networkVisualFluid={} source=CreatePipeConnection flowHint=true",
-                            end.pipe, end.face, worldPos, action, live, fluidState.getType(), fluidState.isSource(), visualFluid, networkVisualFluid);
+                    DebugInfo.log(level, "VISUAL planned pipe={} face={} pos={} action={} live={} visualSource={} fluid={} source={} visualFluid={} networkVisualFluid={} flowHint=true",
+                            end.pipe, end.face, worldPos, action, live, visualSource, fluidState.getType(), fluidState.isSource(), visualFluid, networkVisualFluid);
                 }
             }
 
             int routeHints = applyRouteFlowHints(level, scan, plannedEnds, activeFaces);
             int passiveHints = applyPassiveFullnessHints(level, scan, activeFaces);
-            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} tankContacts={} livePlanned={} lingered={} skipped={} routeHints={} passiveHints={} networkVisualFluid={} source=NetworkPressurePlanner/CreatePipeConnection",
-                    owner, scan.openEnds.size(), scan.tankContacts.size(), livePlanned, lingered, skipped, routeHints, passiveHints, networkVisualFluid);
+            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} tankContacts={} livePlanned={} eventPlanned={} lingered={} skipped={} routeHints={} passiveHints={} networkVisualFluid={} source=Planner/Event/CreatePipeConnection",
+                    owner, scan.openEnds.size(), scan.tankContacts.size(), livePlanned, eventPlanned, lingered, skipped, routeHints, passiveHints, networkVisualFluid);
         } finally {
             if (debug) DebugInfo.endNetwork();
         }
+    }
+
+    private static NetworkPressurePlanner.PlannedVisual toPlannerVisual(WorldExchangeVisualEvents.Action action) {
+        return action == WorldExchangeVisualEvents.Action.INTAKE
+                ? NetworkPressurePlanner.PlannedVisual.INTAKE
+                : NetworkPressurePlanner.PlannedVisual.OUTPUT;
     }
 
     private static void rememberVisual(Level level, OpenEnd end, NetworkPressurePlanner.PlannedVisual action) {
@@ -235,6 +254,9 @@ public final class WorldExchangeVisualLayer {
 
     private static FluidStack networkVisualFluid(Level level, VisualScan scan) {
         for (OpenEnd end : scan.openEnds) {
+            WorldExchangeVisualEvents.VisualEvent event = WorldExchangeVisualEvents.visualFor(level, end.pipe, end.face);
+            if (event != null && event.action() == WorldExchangeVisualEvents.Action.INTAKE && !event.fluid().isEmpty()) return event.fluid().copy();
+
             NetworkPressurePlanner.PlannedVisual action = NetworkPressurePlanner.visualFor(level, end.pipe, end.face);
             if (action != NetworkPressurePlanner.PlannedVisual.INTAKE) continue;
 
@@ -253,7 +275,9 @@ public final class WorldExchangeVisualLayer {
         return new FluidStack(Fluids.WATER, WORLD_BLOCK_MB);
     }
 
-    private static FluidStack visualFluid(Level level, OpenEnd end, NetworkPressurePlanner.PlannedVisual action, FluidStack networkVisualFluid) {
+    private static FluidStack visualFluid(Level level, OpenEnd end, NetworkPressurePlanner.PlannedVisual action, FluidStack networkVisualFluid, FluidStack eventFluid) {
+        if (eventFluid != null && !eventFluid.isEmpty()) return eventFluid.copy();
+
         if (action == NetworkPressurePlanner.PlannedVisual.INTAKE) {
             FluidStack drained = CreateWorldEndIO.simulateDrain(level, end.pipe, end.face);
             if (!drained.isEmpty()) return drained;
