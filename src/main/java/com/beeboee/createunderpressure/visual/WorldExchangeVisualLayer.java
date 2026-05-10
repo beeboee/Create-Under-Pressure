@@ -18,7 +18,6 @@ import java.util.WeakHashMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
-import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.level.material.FluidState;
 import net.neoforged.neoforge.fluids.FluidStack;
@@ -26,9 +25,9 @@ import net.neoforged.neoforge.fluids.FluidStack;
 /**
  * Cosmetic-only world exchange effects for open pipe ends.
  *
- * This layer follows shared hydraulic plans, legacy planner visuals, and shared
- * simulation events, then delegates particles and Create pipe flow/fullness
- * hints to Create's helpers.
+ * World-end active flow is now authoritative: shared HydraulicPlan intent or a
+ * recent successful WorldExchangeVisualEvent. Legacy planner guesses and open-end
+ * passive fullness are intentionally not used for direction/fullness hints.
  */
 public final class WorldExchangeVisualLayer {
     private WorldExchangeVisualLayer() {}
@@ -63,7 +62,6 @@ public final class WorldExchangeVisualLayer {
         boolean debug = DebugInfo.isEnabled(level);
         if (debug) DebugInfo.beginNetwork(level, scan.pipes, owner);
         try {
-            int livePlanned = 0;
             int eventPlanned = 0;
             int sharedPlanPlanned = 0;
             int lingered = 0;
@@ -77,13 +75,6 @@ public final class WorldExchangeVisualLayer {
                 String visualSource = "sharedPlan";
                 boolean live = action != null;
                 if (live) sharedPlanPlanned++;
-
-                if (action == null) {
-                    action = NetworkPressurePlanner.visualFor(level, end.pipe, end.face);
-                    visualSource = "planner";
-                    live = action != null;
-                    if (live) livePlanned++;
-                }
 
                 WorldExchangeVisualEvents.VisualEvent event = WorldExchangeVisualEvents.visualFor(level, end.pipe, end.face);
                 FluidStack eventFluid = event == null ? FluidStack.EMPTY : event.fluid();
@@ -103,7 +94,7 @@ public final class WorldExchangeVisualLayer {
                 BlockPos worldPos = end.worldPos();
                 if (action == null) {
                     skipped++;
-                    if (debug) DebugInfo.log(level, "VISUAL skip pipe={} face={} pos={} reason=noPlannerAction", end.pipe, end.face, worldPos);
+                    if (debug) DebugInfo.log(level, "VISUAL skip pipe={} face={} pos={} reason=noSharedPlanOrEvent", end.pipe, end.face, worldPos);
                     continue;
                 }
 
@@ -122,9 +113,9 @@ public final class WorldExchangeVisualLayer {
             }
 
             int routeHints = applyRouteFlowHints(level, scan, plannedEnds, activeFaces);
-            int passiveHints = applyPassiveFullnessHints(level, scan, activeFaces);
-            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} tankContacts={} sharedPlanPlanned={} livePlanned={} eventPlanned={} lingered={} skipped={} routeHints={} passiveHints={} networkVisualFluid={} source=SharedPlan/Planner/Event/CreatePipeConnection",
-                    owner, scan.openEnds.size(), scan.tankContacts.size(), sharedPlanPlanned, livePlanned, eventPlanned, lingered, skipped, routeHints, passiveHints, networkVisualFluid);
+            int passiveHints = applyTankPassiveFullnessHints(level, scan, activeFaces);
+            if (debug) DebugInfo.log(level, "VISUAL scan owner={} openEnds={} tankContacts={} sharedPlanPlanned={} eventPlanned={} lingered={} skipped={} routeHints={} passiveHints={} networkVisualFluid={} source=SharedPlan/Event/CreatePipeConnection",
+                    owner, scan.openEnds.size(), scan.tankContacts.size(), sharedPlanPlanned, eventPlanned, lingered, skipped, routeHints, passiveHints, networkVisualFluid);
         } finally {
             if (debug) DebugInfo.endNetwork();
         }
@@ -153,21 +144,8 @@ public final class WorldExchangeVisualLayer {
         return null;
     }
 
-    private static int applyPassiveFullnessHints(Level level, VisualScan scan, Set<VisualKey> activeFaces) {
+    private static int applyTankPassiveFullnessHints(Level level, VisualScan scan, Set<VisualKey> activeFaces) {
         int applied = 0;
-
-        for (OpenEnd end : scan.openEnds) {
-            VisualKey key = new VisualKey(end.pipe, end.face);
-            if (activeFaces.contains(key)) continue;
-            FluidState fluidState = level.getFluidState(end.worldPos());
-            if (fluidState.isEmpty()) continue;
-            FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, end.pipe);
-            CreatePipeFlowVisualBridge.apply(level, pipe, end.pipe, end.face, true, PASSIVE_FULLNESS_PRESSURE);
-            activeFaces.add(key);
-            applied++;
-            DebugInfo.log(level, "VISUAL passiveFullness pipe={} face={} pos={} reason=openEndTouchesFluid fluid={} source={}",
-                    end.pipe, end.face, end.worldPos(), fluidState.getType(), fluidState.isSource());
-        }
 
         for (TankContact contact : scan.tankContacts) {
             VisualKey key = new VisualKey(contact.pipe, contact.face);
@@ -269,7 +247,6 @@ public final class WorldExchangeVisualLayer {
             if (event != null && event.action() == WorldExchangeVisualEvents.Action.INTAKE && !event.fluid().isEmpty()) return event.fluid().copy();
 
             NetworkPressurePlanner.PlannedVisual action = HydraulicPlanRuntime.visualFor(level, end.pipe, end.face);
-            if (action == null) action = NetworkPressurePlanner.visualFor(level, end.pipe, end.face);
             if (action != NetworkPressurePlanner.PlannedVisual.INTAKE) continue;
 
             FluidStack drained = CreateWorldEndIO.simulateDrain(level, end.pipe, end.face);
@@ -319,8 +296,7 @@ public final class WorldExchangeVisualLayer {
             if (pipe == null) continue;
             pipes.add(node.pos);
 
-            BlockState state = level.getBlockState(node.pos);
-            for (Direction face : FluidPropagator.getPipeConnections(state, pipe)) {
+            for (Direction face : FluidPropagator.getPipeConnections(level.getBlockState(node.pos), pipe)) {
                 BlockPos other = node.pos.relative(face);
                 if (!level.isLoaded(other)) continue;
 
