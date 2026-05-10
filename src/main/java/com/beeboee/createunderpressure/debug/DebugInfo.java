@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -43,11 +44,14 @@ public final class DebugInfo {
     private static final DateTimeFormatter LINE_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     private static final Map<UUID, String> lastChatMessages = new HashMap<>();
+    private static String lastCommandSayMessage = null;
 
     private static long debugUntilGameTime = -1L;
     private static UUID activePlayerId = null;
     private static ItemStack activeStack = ItemStack.EMPTY;
     private static Path activeLogFile = null;
+    private static String activeLogLabel = null;
+    private static String activeLogTimestamp = null;
     private static boolean endedMessageSent = true;
     private static BlockPos selectedTarget = null;
     private static DebugStackNameState storedStackNameState = null;
@@ -63,6 +67,17 @@ public final class DebugInfo {
 
         if (activeLogFile != null && !endedMessageSent) {
             writeLine("CHAT " + player.getName().getString() + ": " + stripped);
+        }
+    }
+
+    public static void rememberCommandSay(Level level, String source, String message) {
+        if (message == null || message.isBlank()) return;
+        String stripped = message.strip();
+        lastCommandSayMessage = stripped;
+
+        if (activeLogFile != null && !endedMessageSent) {
+            retitleActiveLogFile(stripped);
+            writeLine("SAY " + (source == null || source.isBlank() ? "command" : source) + ": " + stripped);
         }
     }
 
@@ -134,6 +149,8 @@ public final class DebugInfo {
         activePlayerId = null;
         activeStack = ItemStack.EMPTY;
         activeLogFile = null;
+        activeLogLabel = null;
+        activeLogTimestamp = null;
         selectedTarget = null;
         storedStackNameState = null;
         clearNetworkContext();
@@ -305,6 +322,8 @@ public final class DebugInfo {
         activePlayerId = null;
         activeStack = ItemStack.EMPTY;
         activeLogFile = null;
+        activeLogLabel = null;
+        activeLogTimestamp = null;
         selectedTarget = null;
         storedStackNameState = null;
         clearNetworkContext();
@@ -337,9 +356,26 @@ public final class DebugInfo {
             CreateUnderPressure.LOGGER.warn("Could not create Create: Under Pressure debug log directory", e);
         }
 
-        String label = sanitizedLabel(lastChatMessages.get(player.getUUID()));
-        String timestamp = LocalDateTime.now().format(FILE_TIME);
-        return dir.resolve(label + "-" + timestamp + ".txt");
+        String rawLabel = lastCommandSayMessage != null ? lastCommandSayMessage : lastChatMessages.get(player.getUUID());
+        activeLogLabel = sanitizedLabel(rawLabel);
+        activeLogTimestamp = LocalDateTime.now().format(FILE_TIME);
+        return dir.resolve(activeLogLabel + "-" + activeLogTimestamp + ".txt");
+    }
+
+    private static void retitleActiveLogFile(String rawLabel) {
+        if (activeLogFile == null) return;
+        if (activeLogTimestamp == null) activeLogTimestamp = LocalDateTime.now().format(FILE_TIME);
+        String nextLabel = sanitizedLabel(rawLabel);
+        if (nextLabel.equals(activeLogLabel)) return;
+
+        Path nextPath = activeLogFile.resolveSibling(nextLabel + "-" + activeLogTimestamp + ".txt");
+        try {
+            Files.move(activeLogFile, nextPath, StandardCopyOption.REPLACE_EXISTING);
+            activeLogFile = nextPath;
+            activeLogLabel = nextLabel;
+        } catch (IOException e) {
+            CreateUnderPressure.LOGGER.warn("Could not rename Create: Under Pressure debug log file", e);
+        }
     }
 
     private static String sanitizedLabel(String raw) {
