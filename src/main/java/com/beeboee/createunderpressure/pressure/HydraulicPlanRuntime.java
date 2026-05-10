@@ -18,6 +18,8 @@ import net.minecraft.world.level.Level;
 public final class HydraulicPlanRuntime {
     private HydraulicPlanRuntime() {}
 
+    private static final int MAX_VISUAL_PLAN_AGE = 8;
+
     private static final Map<Level, Map<BlockPos, CachedPlan>> PLANS = new WeakHashMap<>();
     private static final Map<Level, Map<BlockPos, Set<String>>> LAST_SELECTED_ROUTES = new WeakHashMap<>();
 
@@ -66,7 +68,10 @@ public final class HydraulicPlanRuntime {
         Map<BlockPos, CachedPlan> levelPlans = PLANS.get(level);
         if (levelPlans == null || levelPlans.isEmpty()) return null;
 
+        long gameTime = level.getGameTime();
+        levelPlans.entrySet().removeIf(entry -> gameTime - entry.getValue().gameTime() > MAX_VISUAL_PLAN_AGE);
         for (CachedPlan cached : levelPlans.values()) {
+            if (gameTime - cached.gameTime() > MAX_VISUAL_PLAN_AGE) continue;
             NetworkPressurePlanner.PlannedVisual visual = visualFor(cached.plan(), pipe, face);
             if (visual != null) return visual;
         }
