@@ -26,6 +26,8 @@ public final class TankQoLService {
     private static final int MAX_DISTANCE = 96;
     private static final int EDGE_CLEANUP_MB = 5;
     private static final int COMMON_SNAP_MAX_SPREAD_MB = 32;
+    private static final long STABLE_BEFORE_CLEANUP_TICKS = 100;
+    private static final Map<BlockPos, TankSnapshot> STABILITY = new HashMap<>();
 
     public static void tickTank(FluidTankBlockEntity tickTank) {
         Level level = tickTank.getLevel();
@@ -38,6 +40,7 @@ public final class TankQoLService {
 
         FluidStack groupFluid = groupFluid(network.tanks);
         if (groupFluid == null || groupFluid.isEmpty()) return;
+        if (!stableLongEnough(level, network)) return;
 
         Random random = new Random(level.getGameTime() ^ tickTank.getController().asLong());
         int cleaned = cleanupEdges(network.tanks, random);
@@ -46,6 +49,25 @@ public final class TankQoLService {
         if (cleaned > 0 || balanced > 0) {
             DebugInfo.log(level, "TANK qol source={} tanks={} cleanup={} balanced={}", tickTank.getController(), network.tanks.size(), cleaned, balanced);
         }
+    }
+
+    private static boolean stableLongEnough(Level level, TankNetwork network) {
+        Map<BlockPos, Integer> amounts = tankAmounts(network.tanks);
+        BlockPos key = network.owner.getController();
+        TankSnapshot previous = STABILITY.get(key);
+
+        if (previous == null || !previous.amounts.equals(amounts)) {
+            STABILITY.put(key, new TankSnapshot(level.getGameTime(), amounts));
+            return false;
+        }
+
+        return level.getGameTime() - previous.stableSince >= STABLE_BEFORE_CLEANUP_TICKS;
+    }
+
+    private static Map<BlockPos, Integer> tankAmounts(List<FluidTankBlockEntity> tanks) {
+        Map<BlockPos, Integer> amounts = new HashMap<>();
+        for (FluidTankBlockEntity tank : tanks) amounts.put(tank.getController(), tank.getTankInventory().getFluidAmount());
+        return amounts;
     }
 
     private static int cleanupEdges(List<FluidTankBlockEntity> tanks, Random random) {
@@ -276,4 +298,5 @@ public final class TankQoLService {
     }
 
     private record TankNetwork(List<FluidTankBlockEntity> tanks, FluidTankBlockEntity owner) {}
+    private record TankSnapshot(long stableSince, Map<BlockPos, Integer> amounts) {}
 }

@@ -5,12 +5,18 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
@@ -18,38 +24,81 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.SignBlockEntity;
+import net.minecraft.world.level.block.entity.SignText;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.FluidState;
 
 public final class DebugInfo {
     private DebugInfo() {}
 
+    private static final String DEBUG_BUILD = "pressure-graph-v0.1.2/9aff98f+";
     private static final int DEFAULT_SECONDS = 10;
     private static final int MAX_FILENAME_LABEL_LENGTH = 64;
+    private static final int MAX_NETWORK_LABEL_LENGTH = 32;
+    private static final int LOOSE_TARGET_RADIUS = 8;
+    private static final Pattern BLOCK_POS_PATTERN = Pattern.compile("BlockPos\\{x=(-?\\d+), y=(-?\\d+), z=(-?\\d+)\\}");
+    private static final Pattern OPEN_EXTERNAL_PATTERN = Pattern.compile("external@BlockPos\\{x=(-?\\d+), y=(-?\\d+), z=(-?\\d+)\\}[^ ]*/open=true");
     private static final DateTimeFormatter FILE_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss");
     private static final DateTimeFormatter LINE_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     private static final Map<UUID, String> lastChatMessages = new HashMap<>();
+    private static String lastCommandSayMessage = null;
 
     private static long debugUntilGameTime = -1L;
     private static UUID activePlayerId = null;
     private static ItemStack activeStack = ItemStack.EMPTY;
     private static Path activeLogFile = null;
+    private static String activeLogLabel = null;
+    private static String activeLogTimestamp = null;
     private static boolean endedMessageSent = true;
+    private static BlockPos selectedTarget = null;
+    private static DebugStackNameState storedStackNameState = null;
+
+    private static boolean networkContextActive = false;
+    private static boolean networkContextAllowed = true;
+    private static String networkContextTag = null;
 
     public static void rememberChat(Player player, String message) {
         if (player == null || message == null || message.isBlank()) return;
-        lastChatMessages.put(player.getUUID(), message.strip());
+        String stripped = message.strip();
+        lastChatMessages.put(player.getUUID(), stripped);
+
+        if (activeLogFile != null && !endedMessageSent) {
+            writeLine("CHAT " + player.getName().getString() + ": " + stripped);
+        }
+    }
+
+    public static void rememberCommandSay(Level level, String source, String message) {
+        if (message == null || message.isBlank()) return;
+        String stripped = message.strip();
+        lastCommandSayMessage = stripped;
+
+        if (activeLogFile != null && !endedMessageSent) {
+            retitleActiveLogFile(stripped);
+            writeLine("SAY " + (source == null || source.isBlank() ? "command" : source) + ": " + stripped);
+        }
     }
 
     public static void toggle(Level level, Player player, ItemStack stack, boolean stop) {
+        toggle(level, player, stack, stop, null);
+    }
+
+    public static void toggle(Level level, Player player, ItemStack stack, boolean stop, BlockPos target) {
         if (stop && isEnabled(level)) {
             disable(level, player, "Create: Under Pressure debug logging stopped");
             return;
         }
 
-        enable(level, player, stack, DEFAULT_SECONDS);
+        enable(level, player, stack, DEFAULT_SECONDS, target);
     }
 
     public static void enable(Level level, Player player, ItemStack stack, int seconds) {
+        enable(level, player, stack, seconds, null);
+    }
+
+    public static void enable(Level level, Player player, ItemStack stack, int seconds, BlockPos target) {
         long now = level.getGameTime();
         boolean extending = isEnabled(level);
 
@@ -59,14 +108,19 @@ public final class DebugInfo {
         activePlayerId = player.getUUID();
         activeStack = stack;
         endedMessageSent = false;
+        if (!extending) storedStackNameState = DebugStackNameState.capture(stack);
+        if (target != null) selectedTarget = target.immutable();
+        else if (!extending) selectedTarget = null;
         setGlint(stack, true);
+        updateStackCountdown(level);
 
         if (!extending || activeLogFile == null) activeLogFile = newLogFile(player);
 
-        long remainingSeconds = Math.max(0, (debugUntilGameTime - now + 19L) / 20L);
+        long remainingSeconds = remainingSeconds(level);
+        String scope = selectedTarget == null ? "global" : "network near " + selectedTarget.toShortString();
         Component message = Component.literal(extending
-            ? "Create: Under Pressure debug logging extended by " + seconds + " seconds (" + remainingSeconds + "s remaining)"
-            : "Create: Under Pressure debug logging enabled for " + seconds + " seconds");
+            ? "Create: Under Pressure debug logging extended by " + seconds + " seconds (" + remainingSeconds + "s remaining, " + scope + ", build " + DEBUG_BUILD + ")"
+            : "Create: Under Pressure debug logging enabled for " + seconds + " seconds (" + scope + ", build " + DEBUG_BUILD + ")");
 
         player.displayClientMessage(message, true);
         writeLine("SESSION " + message.getString());
@@ -74,13 +128,19 @@ public final class DebugInfo {
     }
 
     public static void tick(ServerLevel level) {
-        if (endedMessageSent || debugUntilGameTime < 0L || level.getGameTime() <= debugUntilGameTime) return;
+        if (!endedMessageSent && debugUntilGameTime >= 0L && level.getGameTime() <= debugUntilGameTime) {
+            updateStackCountdown(level);
+            return;
+        }
+
+        if (endedMessageSent || debugUntilGameTime < 0L) return;
 
         endedMessageSent = true;
         setGlint(activeStack, false);
+        restoreStackName();
 
         ServerPlayer player = activePlayerId == null ? null : level.getServer().getPlayerList().getPlayer(activePlayerId);
-        Component message = Component.literal("Create: Under Pressure debug logging finished");
+        Component message = Component.literal("Create: Under Pressure debug logging finished (build " + DEBUG_BUILD + ")");
         if (player != null) player.displayClientMessage(message, true);
 
         writeLine("SESSION " + message.getString());
@@ -89,25 +149,172 @@ public final class DebugInfo {
         activePlayerId = null;
         activeStack = ItemStack.EMPTY;
         activeLogFile = null;
+        activeLogLabel = null;
+        activeLogTimestamp = null;
+        selectedTarget = null;
+        storedStackNameState = null;
+        clearNetworkContext();
     }
 
     public static boolean isEnabled(Level level) {
         return level != null && level.getGameTime() <= debugUntilGameTime;
     }
 
+    public static boolean beginNetwork(Level level, Set<BlockPos> networkPipes, BlockPos owner) {
+        networkContextActive = true;
+        networkContextAllowed = isEnabled(level) && (selectedTarget == null || touchesSelectedTarget(networkPipes));
+        networkContextTag = networkTag(level, networkPipes, owner);
+        return networkContextAllowed;
+    }
+
+    public static void endNetwork() {
+        clearNetworkContext();
+    }
+
+    public static boolean isNetworkAllowed() {
+        return !networkContextActive || networkContextAllowed;
+    }
+
     public static void log(Level level, String message, Object... args) {
         if (!isEnabled(level)) return;
+        if (!isNetworkAllowed()) return;
 
-        CreateUnderPressure.LOGGER.info(message, args);
-        writeLine(format(message, args));
+        String formatted = format(message, args);
+        if (!networkContextActive && !passesLooseTargetFilter(formatted)) return;
+        formatted = enrichOpenExternalEnds(level, formatted);
+        if (networkContextActive && networkContextTag != null) formatted = "[" + networkContextTag + "] " + formatted;
+
+        CreateUnderPressure.LOGGER.info("{}", formatted);
+        writeLine(formatted);
+    }
+
+    private static String networkTag(Level level, Set<BlockPos> networkPipes, BlockPos owner) {
+        String coordinateTag = owner == null ? "net@unknown" : "net@" + owner.toShortString();
+        String label = networkLabel(level, networkPipes);
+        return label == null ? coordinateTag : "net:" + label + "@" + (owner == null ? "unknown" : owner.toShortString());
+    }
+
+    private static String networkLabel(Level level, Set<BlockPos> networkPipes) {
+        if (level == null || networkPipes == null || networkPipes.isEmpty()) return null;
+
+        for (BlockPos pipe : networkPipes) {
+            for (Direction direction : Direction.values()) {
+                BlockPos signPos = pipe.relative(direction);
+                if (!level.isLoaded(signPos)) continue;
+                String label = signLabel(level.getBlockEntity(signPos));
+                if (label != null) return label;
+            }
+        }
+
+        return null;
+    }
+
+    private static String signLabel(BlockEntity blockEntity) {
+        if (!(blockEntity instanceof SignBlockEntity sign)) return null;
+
+        String first = signLine(sign.getFrontText(), 0);
+        String second = signLine(sign.getFrontText(), 1);
+        if (first == null) first = signLine(sign.getBackText(), 0);
+        if (second == null) second = signLine(sign.getBackText(), 1);
+
+        String label;
+        if (first != null && first.equalsIgnoreCase("network") && second != null) label = second;
+        else label = first != null ? first : second;
+
+        if (label == null) return null;
+        label = sanitizedNetworkLabel(label);
+        return label.isBlank() ? null : label;
+    }
+
+    private static String signLine(SignText text, int line) {
+        if (text == null) return null;
+        String value = text.getMessage(line, false).getString().strip();
+        return value.isBlank() ? null : value;
+    }
+
+    private static String sanitizedNetworkLabel(String raw) {
+        String cleaned = raw.strip()
+                .replaceAll("[\\\\/:*?\"<>|]", "")
+                .replaceAll("[^A-Za-z0-9._ -]", "")
+                .replaceAll("\\s+", "_")
+                .replaceAll("_+", "_")
+                .replaceAll("^[._ -]+", "")
+                .replaceAll("[._ -]+$", "");
+        if (cleaned.length() > MAX_NETWORK_LABEL_LENGTH) cleaned = cleaned.substring(0, MAX_NETWORK_LABEL_LENGTH);
+        return cleaned;
+    }
+
+    private static String enrichOpenExternalEnds(Level level, String line) {
+        if (level == null || !line.contains("external@") || !line.contains("/open=true")) return line;
+
+        Matcher matcher = OPEN_EXTERNAL_PATTERN.matcher(line);
+        StringBuilder details = new StringBuilder();
+        int index = 0;
+        while (matcher.find()) {
+            BlockPos pos = new BlockPos(
+                Integer.parseInt(matcher.group(1)),
+                Integer.parseInt(matcher.group(2)),
+                Integer.parseInt(matcher.group(3))
+            );
+            if (!level.isLoaded(pos)) continue;
+
+            details.append(" openEnd[").append(index++).append("]=")
+                .append(pos.toShortString()).append("/")
+                .append(openEndWorldState(level, pos));
+        }
+
+        return details.isEmpty() ? line : line + details;
+    }
+
+    private static String openEndWorldState(Level level, BlockPos pos) {
+        BlockState blockState = level.getBlockState(pos);
+        FluidState fluidState = level.getFluidState(pos);
+
+        if (blockState.isAir()) return "air/sourceAirFlow=flowing";
+        if (!fluidState.isEmpty()) return "fluid=" + fluidState.getType() + "/source=" + fluidState.isSource() + "/sourceAirFlow=blocked";
+        return "block=" + blockState.getBlock() + "/sourceAirFlow=blocked";
+    }
+
+    private static boolean touchesSelectedTarget(Set<BlockPos> networkPipes) {
+        if (selectedTarget == null) return true;
+        for (BlockPos pipe : networkPipes) {
+            if (pipe.distManhattan(selectedTarget) <= 1) return true;
+        }
+        return false;
+    }
+
+    private static boolean passesLooseTargetFilter(String line) {
+        if (selectedTarget == null) return true;
+
+        String shortPos = selectedTarget.toShortString();
+        String longPos = selectedTarget.toString();
+        if (line.contains(shortPos) || line.contains(longPos)) return true;
+
+        Matcher matcher = BLOCK_POS_PATTERN.matcher(line);
+        while (matcher.find()) {
+            int x = Integer.parseInt(matcher.group(1));
+            int y = Integer.parseInt(matcher.group(2));
+            int z = Integer.parseInt(matcher.group(3));
+            int distance = Math.abs(x - selectedTarget.getX()) + Math.abs(y - selectedTarget.getY()) + Math.abs(z - selectedTarget.getZ());
+            if (distance <= LOOSE_TARGET_RADIUS) return true;
+        }
+
+        return false;
+    }
+
+    private static void clearNetworkContext() {
+        networkContextActive = false;
+        networkContextAllowed = true;
+        networkContextTag = null;
     }
 
     private static void disable(Level level, Player player, String text) {
         debugUntilGameTime = level.getGameTime() - 1L;
         endedMessageSent = true;
         setGlint(activeStack, false);
+        restoreStackName();
 
-        Component message = Component.literal(text);
+        Component message = Component.literal(text + " (build " + DEBUG_BUILD + ")");
         player.displayClientMessage(message, true);
         writeLine("SESSION " + message.getString());
         CreateUnderPressure.LOGGER.info("{}", message.getString());
@@ -115,6 +322,25 @@ public final class DebugInfo {
         activePlayerId = null;
         activeStack = ItemStack.EMPTY;
         activeLogFile = null;
+        activeLogLabel = null;
+        activeLogTimestamp = null;
+        selectedTarget = null;
+        storedStackNameState = null;
+        clearNetworkContext();
+    }
+
+    private static long remainingSeconds(Level level) {
+        return Math.max(0, (debugUntilGameTime - level.getGameTime() + 19L) / 20L);
+    }
+
+    private static void updateStackCountdown(Level level) {
+        if (activeStack == null || activeStack.isEmpty() || level == null || endedMessageSent || debugUntilGameTime < 0L) return;
+        activeStack.set(DataComponents.CUSTOM_NAME, Component.literal("Debug: " + remainingSeconds(level) + "s"));
+    }
+
+    private static void restoreStackName() {
+        if (activeStack == null || activeStack.isEmpty() || storedStackNameState == null) return;
+        storedStackNameState.restore(activeStack);
     }
 
     private static void setGlint(ItemStack stack, boolean enabled) {
@@ -130,9 +356,26 @@ public final class DebugInfo {
             CreateUnderPressure.LOGGER.warn("Could not create Create: Under Pressure debug log directory", e);
         }
 
-        String label = sanitizedLabel(lastChatMessages.get(player.getUUID()));
-        String timestamp = LocalDateTime.now().format(FILE_TIME);
-        return dir.resolve(label + "-" + timestamp + ".txt");
+        String rawLabel = lastCommandSayMessage != null ? lastCommandSayMessage : lastChatMessages.get(player.getUUID());
+        activeLogLabel = sanitizedLabel(rawLabel);
+        activeLogTimestamp = LocalDateTime.now().format(FILE_TIME);
+        return dir.resolve(activeLogLabel + "-" + activeLogTimestamp + ".txt");
+    }
+
+    private static void retitleActiveLogFile(String rawLabel) {
+        if (activeLogFile == null) return;
+        if (activeLogTimestamp == null) activeLogTimestamp = LocalDateTime.now().format(FILE_TIME);
+        String nextLabel = sanitizedLabel(rawLabel);
+        if (nextLabel.equals(activeLogLabel)) return;
+
+        Path nextPath = activeLogFile.resolveSibling(nextLabel + "-" + activeLogTimestamp + ".txt");
+        try {
+            Files.move(activeLogFile, nextPath, StandardCopyOption.REPLACE_EXISTING);
+            activeLogFile = nextPath;
+            activeLogLabel = nextLabel;
+        } catch (IOException e) {
+            CreateUnderPressure.LOGGER.warn("Could not rename Create: Under Pressure debug log file", e);
+        }
     }
 
     private static String sanitizedLabel(String raw) {
@@ -177,5 +420,18 @@ public final class DebugInfo {
 
         while (argIndex < args.length) out.append(' ').append(String.valueOf(args[argIndex++]));
         return out.toString();
+    }
+
+    private record DebugStackNameState(boolean hadCustomName, Component customName) {
+        static DebugStackNameState capture(ItemStack stack) {
+            Component customName = stack == null || stack.isEmpty() ? null : stack.get(DataComponents.CUSTOM_NAME);
+            return new DebugStackNameState(customName != null, customName);
+        }
+
+        void restore(ItemStack stack) {
+            if (stack == null || stack.isEmpty()) return;
+            if (hadCustomName) stack.set(DataComponents.CUSTOM_NAME, customName);
+            else stack.remove(DataComponents.CUSTOM_NAME);
+        }
     }
 }
