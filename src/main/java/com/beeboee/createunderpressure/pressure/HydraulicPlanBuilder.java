@@ -18,8 +18,10 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.level.material.Fluids;
@@ -30,11 +32,8 @@ import net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction;
 
 /**
  * Scans Create's real pipe topology and produces a contact-aware hydraulic plan.
- *
- * Head determines reachability and direction. Throughput is deliberately separate:
- * selected routes request at most 128 mB for the next tick, and HydraulicRuntime
- * converts that request to Create pressure. World endpoints are ordinary 128 mB/t
- * streams; the hose-pulley handler buffers them into 1000 mB world operations.
+ * Head determines reachability and direction; throughput is a separate 128 mB/t
+ * budget that HydraulicRuntime projects into Create's own fluid network.
  */
 public final class HydraulicPlanBuilder {
     private HydraulicPlanBuilder() {}
@@ -47,7 +46,7 @@ public final class HydraulicPlanBuilder {
     public static final int MAX_FLOW_MB = FLOW_RATE_MB_PER_TICK;
     public static final double HEAD_DEAD_BAND = 0.01;
 
-    // Retained as compatibility/debug constants. They no longer affect throughput.
+    // Compatibility/debug constants; route resistance no longer controls flow.
     public static final double FLOW_SCALE = FLOW_RATE_MB_PER_TICK;
     public static final double BASE_ROUTE_RESISTANCE = 1.0;
     public static final double PIPE_RESISTANCE = 0.0;
@@ -84,11 +83,11 @@ public final class HydraulicPlanBuilder {
 
     private static Snapshot scan(Level level, BlockPos seed) {
         Set<BlockPos> pipes = new HashSet<>();
-        Map<BlockPos, FluidTransportBehaviour> behaviours = new HashMap<>();
         Map<BlockPos, List<Direction>> facesByPipe = new HashMap<>();
         List<PortState> ports = new ArrayList<>();
         Set<String> portKeys = new HashSet<>();
         Set<BlockPos> pumps = new HashSet<>();
+        Set<BlockPos> expandedTanks = new HashSet<>();
         ArrayDeque<Node> queue = new ArrayDeque<>();
         queue.add(new Node(seed, 0));
 
@@ -99,16 +98,16 @@ public final class HydraulicPlanBuilder {
             FluidTransportBehaviour pipe = FluidPropagator.getPipe(level, node.pos);
             if (pipe == null) continue;
 
-            pipes.add(node.pos.immutable());
-            behaviours.put(node.pos.immutable(), pipe);
-            if (PumpHeadPressure.isPump(level, node.pos)) pumps.add(node.pos.immutable());
+            BlockPos pipePos = node.pos.immutable();
+            pipes.add(pipePos);
+            if (PumpHeadPressure.isPump(level, pipePos)) pumps.add(pipePos);
 
-            List<Direction> faces = new ArrayList<>(FluidPropagator.getPipeConnections(level.getBlockState(node.pos), pipe));
+            List<Direction> faces = new ArrayList<>(FluidPropagator.getPipeConnections(level.getBlockState(pipePos), pipe));
             faces.sort(Comparator.comparingInt(Direction::ordinal));
-            facesByPipe.put(node.pos.immutable(), List.copyOf(faces));
+            facesByPipe.put(pipePos, List.copyOf(faces));
 
             for (Direction face : faces) {
-                BlockPos other = node.pos.relative(face);
+                BlockPos other = pipePos.relative(face);
                 if (!level.isLoaded(other)) continue;
 
                 FluidTransportBehaviour otherPipe = FluidPropagator.getPipe(level, other);
@@ -117,31 +116,57 @@ public final class HydraulicPlanBuilder {
                     continue;
                 }
 
-                String contactKey = node.pos + "|" + face;
+                String contactKey = pipePos + "|" + face;
                 if (!portKeys.add(contactKey)) continue;
 
                 FluidTankBlockEntity tank = tankAt(level, other);
                 if (tank != null) {
-                    ports.add(tankPort(node.pos, face, tank));
+                    ports.add(tankPort(pipePos, face, tank));
+                    if (expandedTanks.add(tank.getController())) {
+                        queueTankPipes(level, tank, queue, node.distance + 1);
+                    }
                     continue;
                 }
 
                 IFluidHandler handler = level.getCapability(Capabilities.FluidHandler.BLOCK, other, face.getOpposite());
                 if (handler != null) {
-                    ports.add(genericPort(node.pos, face, other, handler));
+                    ports.add(genericPort(pipePos, face, other, handler));
                     continue;
                 }
 
-                if (FluidPropagator.isOpenEnd(level, node.pos, face)) ports.add(worldPort(level, node.pos, face));
+                if (FluidPropagator.isOpenEnd(level, pipePos, face)) ports.add(worldPort(level, pipePos, face));
             }
         }
 
         Graph graph = buildGraph(level, pipes, facesByPipe, pumps);
         ports.sort(Comparator.comparing(state -> state.port.id()));
-        return new Snapshot(pipes, behaviours, facesByPipe, ports, pumps, graph);
+        return new Snapshot(pipes, facesByPipe, ports, pumps, graph);
     }
 
-    private static Graph buildGraph(Level level, Set<BlockPos> pipes, Map<BlockPos, List<Direction>> facesByPipe, Set<BlockPos> pumps) {
+    /**
+     * Tanks join separate pipe components into one planning domain, but are not
+     * represented as zero-cost pipe edges. Create must actually fill the tank and
+     * later drain another physical contact; fluid never teleports through storage.
+     */
+    private static void queueTankPipes(Level level, FluidTankBlockEntity tank, ArrayDeque<Node> queue, int distance) {
+        BlockPos base = tank.getController();
+        for (int x = 0; x < tank.getWidth(); x++) {
+            for (int y = 0; y < tank.getHeight(); y++) {
+                for (int z = 0; z < tank.getWidth(); z++) {
+                    BlockPos tankBlock = base.offset(x, y, z);
+                    for (Direction direction : Direction.values()) {
+                        BlockPos pipePos = tankBlock.relative(direction);
+                        if (level.isLoaded(pipePos) && FluidPropagator.getPipe(level, pipePos) != null) {
+                            queue.add(new Node(pipePos, distance));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static Graph buildGraph(Level level, Set<BlockPos> pipes,
+                                    Map<BlockPos, List<Direction>> facesByPipe, Set<BlockPos> pumps) {
         Map<FaceNode, List<Edge>> edges = new HashMap<>();
 
         for (BlockPos pipePos : pipes) {
@@ -278,18 +303,21 @@ public final class HydraulicPlanBuilder {
             }
         }
 
+        Comparator<Candidate> byDeltaDescending = Comparator.comparingDouble(
+                (Candidate candidate) -> candidate.route.deltaHead()).reversed();
         routes.sort(Comparator
                 .comparing((Candidate candidate) -> candidate.route.leased()).reversed()
                 .thenComparingInt(HydraulicPlanBuilder::actionPriority)
-                .thenComparingDouble((Candidate candidate) -> requiredSinkHead(candidate.route.sink()))
-                .thenComparingDouble((Candidate candidate) -> candidate.route.deltaHead()).reversed()
+                .thenComparingDouble(candidate -> requiredSinkHead(candidate.route.sink()))
+                .thenComparing(byDeltaDescending)
                 .thenComparingInt(candidate -> candidate.route.routeLength())
                 .thenComparing(candidate -> candidate.route.source().id())
                 .thenComparing(candidate -> candidate.route.sink().id()));
         return routes;
     }
 
-    private static PathResult findPath(Graph graph, HydraulicPlan.Port source, HydraulicPlan.Port sink, double requiredHead) {
+    private static PathResult findPath(Graph graph, HydraulicPlan.Port source,
+                                       HydraulicPlan.Port sink, double requiredHead) {
         FaceNode start = new FaceNode(source.pipe(), source.face());
         FaceNode target = new FaceNode(sink.pipe(), sink.face());
         if (!graph.edges.containsKey(start) || !graph.edges.containsKey(target)) return null;
@@ -324,7 +352,8 @@ public final class HydraulicPlanBuilder {
                 int nextSteps = current.steps + 1;
                 int nextLength = current.length + (edge.external ? 1 : 0);
                 int nextBends = current.bends + bendCost(edge);
-                SearchState next = new SearchState(edge.to, nextHead, nextSteps, nextLength, nextBends, current, edge, usedPumps);
+                SearchState next = new SearchState(edge.to, nextHead, nextSteps, nextLength, nextBends,
+                        current, edge, usedPumps);
                 List<SearchState> states = best.computeIfAbsent(edge.to, $ -> new ArrayList<>());
                 if (isDominated(states, next)) continue;
                 states.removeIf(existing -> dominates(next, existing));
@@ -372,8 +401,8 @@ public final class HydraulicPlanBuilder {
                 inbound = !previous.pipe.equals(node.pipe) && next.pipe.equals(node.pipe);
                 if (previous.pipe.equals(node.pipe) && !next.pipe.equals(node.pipe)) inbound = false;
             }
-            String key = node.pipe + "|" + node.face + "|" + inbound;
-            uses.putIfAbsent(key, new HydraulicPlan.ConnectionUse(node.pipe, node.face, inbound));
+            uses.putIfAbsent(node.pipe + "|" + node.face + "|" + inbound,
+                    new HydraulicPlan.ConnectionUse(node.pipe, node.face, inbound));
         }
 
         int boost = 0;
@@ -386,16 +415,25 @@ public final class HydraulicPlanBuilder {
     }
 
     private static int sinkRoom(Level level, PortState sink, FluidStack fluid) {
-        if (sink.port.type() == HydraulicPlan.PortType.WORLD) {
-            FluidState state = level.getFluidState(sink.port.owner());
-            if (state.isEmpty()) return WORLD_BLOCK_MB;
-            Fluid existing = FluidHelper.convertToStill(state.getType());
-            return existing.isSame(fluid.getFluid()) ? WORLD_BLOCK_MB : 0;
-        }
+        if (sink.port.type() == HydraulicPlan.PortType.WORLD) return worldSinkRoom(level, sink.port.owner(), fluid);
         if (sink.handler == null) return 0;
         FluidStack probe = fluid.copy();
         probe.setAmount(FLOW_RATE_MB_PER_TICK);
         return sink.handler.fill(probe, FluidAction.SIMULATE);
+    }
+
+    private static int worldSinkRoom(Level level, BlockPos pos, FluidStack fluid) {
+        BlockState block = level.getBlockState(pos);
+        FluidState state = block.getFluidState();
+        if (!state.isEmpty()) {
+            Fluid existing = FluidHelper.convertToStill(state.getType());
+            return existing.isSame(fluid.getFluid()) ? WORLD_BLOCK_MB : 0;
+        }
+        if (block.hasProperty(BlockStateProperties.WATERLOGGED)) {
+            return fluid.getFluid().isSame(Fluids.WATER) && !block.getValue(BlockStateProperties.WATERLOGGED)
+                    ? WORLD_BLOCK_MB : 0;
+        }
+        return block.canBeReplaced() || !block.blocksMotion() ? WORLD_BLOCK_MB : 0;
     }
 
     private static boolean compatible(PortState source, PortState sink) {
@@ -453,8 +491,7 @@ public final class HydraulicPlanBuilder {
     }
 
     private static double requiredSinkHead(HydraulicPlan.Port sink) {
-        if (sink.type() == HydraulicPlan.PortType.TANK) return Math.max(sink.cutoffHead(), sink.head());
-        return sink.cutoffHead();
+        return sink.type() == HydraulicPlan.PortType.TANK ? Math.max(sink.cutoffHead(), sink.head()) : sink.cutoffHead();
     }
 
     private static String routeKey(HydraulicPlan.ActionType action, HydraulicPlan.Port source, HydraulicPlan.Port sink) {
@@ -481,7 +518,8 @@ public final class HydraulicPlanBuilder {
 
     private static int amountForSurface(FluidTankBlockEntity tank, double surfaceY) {
         double height = Math.max(0.0, Math.min(tank.getHeight(), surfaceY - tank.getController().getY()));
-        return Math.max(0, Math.min(tank.getTankInventory().getCapacity(), (int) Math.round(height * layerCapacity(tank))));
+        return Math.max(0, Math.min(tank.getTankInventory().getCapacity(),
+                (int) Math.round(height * layerCapacity(tank))));
     }
 
     private static double layerCapacity(FluidTankBlockEntity tank) {
@@ -501,11 +539,7 @@ public final class HydraulicPlanBuilder {
     }
 
     private static double faceElevation(BlockPos pipe, Direction face) {
-        return pipe.getY() + switch (face) {
-            case UP -> 1.0;
-            case DOWN -> 0.0;
-            default -> 0.5;
-        };
+        return pipe.getY() + (face == Direction.UP ? 1.0 : 0.0);
     }
 
     private static String fluidName(FluidStack stack) {
@@ -543,21 +577,24 @@ public final class HydraulicPlanBuilder {
 
             sources.add(source);
             sinks.add(sink);
-            for (HydraulicPlan.ConnectionUse use : candidate.route.connections()) routeFaces.add(use.pipe() + "|" + use.face());
+            for (HydraulicPlan.ConnectionUse use : candidate.route.connections()) {
+                routeFaces.add(use.pipe() + "|" + use.face());
+            }
             return null;
         }
     }
 
-    public record BuildResult(HydraulicPlan plan, Set<BlockPos> pipes, int candidateCount, int leasedCandidateCount, int pumpCount) {}
-    private record Snapshot(Set<BlockPos> pipes, Map<BlockPos, FluidTransportBehaviour> behaviours,
-                            Map<BlockPos, List<Direction>> facesByPipe, List<PortState> portStates,
-                            Set<BlockPos> pumps, Graph graph) {}
+    public record BuildResult(HydraulicPlan plan, Set<BlockPos> pipes,
+                              int candidateCount, int leasedCandidateCount, int pumpCount) {}
+    private record Snapshot(Set<BlockPos> pipes, Map<BlockPos, List<Direction>> facesByPipe,
+                            List<PortState> portStates, Set<BlockPos> pumps, Graph graph) {}
     private record PortState(HydraulicPlan.Port port, FluidStack fluid, IFluidHandler handler) {}
     private record Graph(Map<FaceNode, List<Edge>> edges) {}
     private record FaceNode(BlockPos pipe, Direction face) {}
     private record Edge(FaceNode from, FaceNode to, int headGain, BlockPos pump, boolean external) {}
     private record Node(BlockPos pos, int distance) {}
-    private record Candidate(HydraulicPlan.ActionType type, HydraulicPlan.Route route, String routeKey, int amountHint) {}
+    private record Candidate(HydraulicPlan.ActionType type, HydraulicPlan.Route route,
+                             String routeKey, int amountHint) {}
     private record RejectedCandidate(Candidate candidate, HydraulicPlan.RejectReason reason) {}
     private record Selection(List<Candidate> selected, List<RejectedCandidate> rejected) {}
     private record PathResult(double deliveredHead, int pumpBoost, int length, int bends,
