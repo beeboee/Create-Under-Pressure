@@ -4,7 +4,9 @@
   "compatibilityLevel": "JAVA_21",
   "mixins": [
     "FluidTankBlockEntityMixin",
-    "FluidTransportBehaviourMixin"
+    "FluidTransportBehaviourMixin",
+    "OpenEndedPipeMixin",
+    "PipeConnectionAccessor"
   ],
   "injectors": {
     "defaultRequire": 1
