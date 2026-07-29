@@ -9,25 +9,25 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
 
-/**
- * Shared runtime cache for the lightweight hydraulic planner.
- *
- * This lets diagnostics, executors, and visual projection read the same
- * last-known plan instead of each subsystem re-inferring intent separately.
- */
+/** Shared current-plan cache for execution adapters, diagnostics, and leases. */
 public final class HydraulicPlanRuntime {
     private HydraulicPlanRuntime() {}
 
-    private static final int MAX_VISUAL_PLAN_AGE = 8;
+    private static final int MAX_PLAN_AGE = 4;
 
     private static final Map<Level, Map<BlockPos, CachedPlan>> PLANS = new WeakHashMap<>();
     private static final Map<Level, Map<BlockPos, Set<String>>> LAST_SELECTED_ROUTES = new WeakHashMap<>();
 
+    public enum WorldMode {
+        NONE,
+        INTAKE,
+        OUTPUT
+    }
+
     public static HydraulicPlanBuilder.BuildResult acquire(Level level, BlockPos seed, long gameTime) {
         CachedPlan cached = cachedContaining(level, seed, gameTime);
         if (cached != null) return cached.result();
-
-        HydraulicPlanBuilder.BuildResult result = HydraulicPlanBuilder.build(level, seed, lastSelectedRouteKeys(level, seed));
+        HydraulicPlanBuilder.BuildResult result = HydraulicPlanBuilder.build(level, seed, lastSelectedRouteKeysContaining(level, seed));
         remember(level, result, gameTime);
         return result;
     }
@@ -43,14 +43,23 @@ public final class HydraulicPlanRuntime {
         Set<String> routeKeys = new HashSet<>();
         for (HydraulicPlan.Action action : plan.actions()) routeKeys.add(action.reservationKey());
         LAST_SELECTED_ROUTES.computeIfAbsent(level, $ -> new HashMap<>())
-                .put(plan.owner(), routeKeys);
+                .put(plan.owner(), Set.copyOf(routeKeys));
+        prune(level, gameTime);
     }
 
-    public static Set<String> lastSelectedRouteKeys(Level level, BlockPos ownerOrSeed) {
-        Map<BlockPos, Set<String>> levelRoutes = LAST_SELECTED_ROUTES.get(level);
-        if (levelRoutes == null) return Set.of();
-        Set<String> routes = levelRoutes.get(ownerOrSeed);
-        return routes == null ? Set.of() : routes;
+    public static Set<String> lastSelectedRouteKeys(Level level, BlockPos owner) {
+        Map<BlockPos, Set<String>> routes = LAST_SELECTED_ROUTES.get(level);
+        if (routes == null) return Set.of();
+        return routes.getOrDefault(owner, Set.of());
+    }
+
+    public static Set<String> lastSelectedRouteKeysContaining(Level level, BlockPos pipe) {
+        Map<BlockPos, CachedPlan> plans = PLANS.get(level);
+        if (plans == null) return Set.of();
+        for (Map.Entry<BlockPos, CachedPlan> entry : plans.entrySet()) {
+            if (entry.getValue().result().pipes().contains(pipe)) return lastSelectedRouteKeys(level, entry.getKey());
+        }
+        return Set.of();
     }
 
     public static HydraulicPlan plan(Level level, BlockPos owner) {
@@ -63,48 +72,47 @@ public final class HydraulicPlanRuntime {
         return cached == null ? null : cached.result();
     }
 
-    public static NetworkPressurePlanner.PlannedVisual visualFor(Level level, BlockPos pipe, Direction face) {
-        if (level == null || pipe == null || face == null) return null;
-        Map<BlockPos, CachedPlan> levelPlans = PLANS.get(level);
-        if (levelPlans == null || levelPlans.isEmpty()) return null;
+    public static WorldMode worldMode(Level level, BlockPos pipe, Direction face) {
+        if (level == null || pipe == null || face == null) return WorldMode.NONE;
+        long time = level.getGameTime();
+        Map<BlockPos, CachedPlan> plans = PLANS.get(level);
+        if (plans == null) return WorldMode.NONE;
 
-        long gameTime = level.getGameTime();
-        levelPlans.entrySet().removeIf(entry -> gameTime - entry.getValue().gameTime() > MAX_VISUAL_PLAN_AGE);
-        for (CachedPlan cached : levelPlans.values()) {
-            if (gameTime - cached.gameTime() > MAX_VISUAL_PLAN_AGE) continue;
-            NetworkPressurePlanner.PlannedVisual visual = visualFor(cached.plan(), pipe, face);
-            if (visual != null) return visual;
+        for (CachedPlan cached : plans.values()) {
+            if (time - cached.gameTime() > MAX_PLAN_AGE) continue;
+            for (HydraulicPlan.Action action : cached.plan().actions()) {
+                HydraulicPlan.Route route = action.route();
+                if (route.source().type() == HydraulicPlan.PortType.WORLD
+                        && pipe.equals(route.source().pipe()) && face == route.source().face()) return WorldMode.INTAKE;
+                if (route.sink().type() == HydraulicPlan.PortType.WORLD
+                        && pipe.equals(route.sink().pipe()) && face == route.sink().face()) return WorldMode.OUTPUT;
+            }
         }
-        return null;
+        return WorldMode.NONE;
     }
 
-    private static NetworkPressurePlanner.PlannedVisual visualFor(HydraulicPlan plan, BlockPos pipe, Direction face) {
-        if (plan == null) return null;
-        for (HydraulicPlan.Action action : plan.actions()) {
-            HydraulicPlan.Route route = action.route();
-            if (route.source().type() == HydraulicPlan.PortType.WORLD
-                    && pipe.equals(route.source().pipe())
-                    && face == route.source().face()) {
-                return NetworkPressurePlanner.PlannedVisual.INTAKE;
-            }
-            if (route.sink().type() == HydraulicPlan.PortType.WORLD
-                    && pipe.equals(route.sink().pipe())
-                    && face == route.sink().face()) {
-                return NetworkPressurePlanner.PlannedVisual.OUTPUT;
-            }
-        }
-        return null;
+    public static NetworkPressurePlanner.PlannedVisual visualFor(Level level, BlockPos pipe, Direction face) {
+        return switch (worldMode(level, pipe, face)) {
+            case INTAKE -> NetworkPressurePlanner.PlannedVisual.INTAKE;
+            case OUTPUT -> NetworkPressurePlanner.PlannedVisual.OUTPUT;
+            case NONE -> null;
+        };
+    }
+
+    private static void prune(Level level, long gameTime) {
+        Map<BlockPos, CachedPlan> plans = PLANS.get(level);
+        if (plans != null) plans.entrySet().removeIf(entry -> gameTime - entry.getValue().gameTime() > MAX_PLAN_AGE);
     }
 
     private static CachedPlan cached(Level level, BlockPos owner) {
-        Map<BlockPos, CachedPlan> levelPlans = PLANS.get(level);
-        return levelPlans == null ? null : levelPlans.get(owner);
+        Map<BlockPos, CachedPlan> plans = PLANS.get(level);
+        return plans == null ? null : plans.get(owner);
     }
 
     private static CachedPlan cachedContaining(Level level, BlockPos seed, long gameTime) {
-        Map<BlockPos, CachedPlan> levelPlans = PLANS.get(level);
-        if (levelPlans == null || levelPlans.isEmpty()) return null;
-        for (CachedPlan cached : levelPlans.values()) {
+        Map<BlockPos, CachedPlan> plans = PLANS.get(level);
+        if (plans == null) return null;
+        for (CachedPlan cached : plans.values()) {
             if (cached.gameTime() == gameTime && cached.result().pipes().contains(seed)) return cached;
         }
         return null;
