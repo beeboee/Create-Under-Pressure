@@ -1,5 +1,6 @@
 package com.beeboee.createunderpressure.debug;
 
+import com.beeboee.createunderpressure.pressure.HydraulicRuntime;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.ParseResults;
 import java.util.HashMap;
@@ -84,6 +85,9 @@ public final class DebugStickEvents {
     @SubscribeEvent
     public static void onLevelTickPost(LevelTickEvent.Post event) {
         if (event.getLevel().isClientSide) return;
-        if (event.getLevel() instanceof net.minecraft.server.level.ServerLevel serverLevel) DebugInfo.tick(serverLevel);
+        if (event.getLevel() instanceof net.minecraft.server.level.ServerLevel serverLevel) {
+            HydraulicRuntime.tickLevel(serverLevel);
+            DebugInfo.tick(serverLevel);
+        }
     }
 }
