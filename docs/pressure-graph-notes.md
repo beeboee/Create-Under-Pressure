@@ -1,196 +1,95 @@
-# Pressure graph notes
+# Deferred Pressure Graph
 
-Working design notes for Create: Under Pressure. This is not final API; it is a place to pin the intended behavior before the next graph rewrite.
+This document records lessons from the retired passive-pressure prototype. It is design input for a later system, not an implementation plan for the Head Turbine MVP.
 
-## Core split
+## Why the prototype was retired
 
-The mod should treat these as related but separate systems:
+The prototype ran from every `FluidTransportBehaviour` tick and scanned the connected network before deciding which pipe owned the update.
 
-1. **Pipe pressure graph**
-   - Moves fluid through pipes when there is a higher source and a lower destination.
-   - Does not require a tank to exist.
-   - Source blocks, tanks, hose-pulley-like intakes, turbines, outlets, and fluid handlers can all be graph nodes.
+That approach had four critical problems:
 
-2. **Tank reservoir solver**
-   - Handles tank-to-tank fill-level balancing.
-   - Uses target fill-Y, not percent alone.
-   - Connected tanks move toward the shared target at the same time.
-   - Highest fill-Y tanks drain first.
-   - Lowest fill-Y tanks receive first.
+1. **Pressure accumulation**
+   - Create's `PipeConnection.addPressure(...)` adds to the stored value.
+   - Reapplying the same graph pressure every few ticks caused unbounded growth.
+   - The mod could not safely wipe only its own contribution without also disturbing pump pressure.
 
-3. **Directional/valve graph rules**
-   - Future one-way valve should be a directional edge in the pipe graph.
-   - Proposed recipe idea: pipe + dried kelp = one-way valve.
-   - Valves should affect pipe-only source movement, tank networks, turbines, and bulk movers.
+2. **Scaling**
+   - Every pipe performed a network scan.
+   - Ownership was checked after scanning.
+   - A network of `n` pipes therefore approached `n` full graph walks per update interval.
 
-## Pipe-only source movement
+3. **Split ownership**
+   - Pipe flow, tank balancing, source selection, and world-fluid behavior were mixed together.
+   - Direct tank cleanup moved fluid outside the visible pipe route.
+   - Pressure, fluid identity, transfer, and source consumption did not share one authoritative transaction.
 
-Pipes should be able to move water/lava sources without tanks.
+4. **Wrong development order**
+   - The global solver grew before the Head Turbine block existed.
+   - The project had no complete player-facing loop to validate whether the pressure model was fun or understandable.
 
-Example:
+The code remains recoverable from Git history if useful pieces need to be referenced later.
 
-```text
-water source
-   |
- pipe
-   |
- pipe
-   |
-outlet below source
-```
+## Requirements before passive pressure returns
 
-Rule:
+A future graph service needs explicit concepts instead of inferred endpoint booleans.
 
-```text
-If a source block is connected to a pipe graph and a valid end point is below the current source location, pressure should carry through the pipes and move fluid toward that lower end.
-```
+### Nodes
 
-This means pipe pressure needs its own ticker/trigger, not only the current tank tick hook. A tank-only tick cannot support pure pipe networks because no tank exists to start the scan.
+- finite reservoir
+- infinite reservoir
+- world source body
+- fluid handler source/sink
+- open outlet
+- turbine
+- bulk mover
 
-## Tanks as reservoir nodes
+Each node must expose fluid identity, available amount, surface/head, transfer limits, and whether it may provide or receive.
 
-Tanks should not be hard breaks in the pressure graph.
+### Edges
 
-Current bad behavior:
+- pipe connection
+- directionality
+- flow resistance or capacity
+- valve state
+- pressure loss
 
-```text
-source above
-   |
- pipe
-   |
- tank
-   |
- pipe
-   |
-outlet below
-```
+### Graph lifecycle
 
-This currently behaves too much like two disconnected systems:
+The graph must be cached per connected component and invalidated by topology or endpoint changes. It should not be rebuilt from every pipe tick.
 
-```text
-source -> pipe -> tank
+A single component owner or level service should perform updates. Component identity must remain stable enough to prevent duplicate work.
 
-tank -> pipe -> outlet
-```
+### Pressure budget
 
-Wanted behavior:
+Pressure needs an owned budget that can be consumed by turbines and losses. Repeated application must replace the mod's previous contribution rather than add another copy.
 
-```text
-source pressure enters tank
-pressure can pass through tank as a reservoir node
-lower outlet can be driven by the higher source/head
-```
+If Create does not expose a safe way to own or replace a pressure contribution, the later system should use a dedicated transfer scheduler instead of mutating Create's pump-pressure fields.
 
-A tank should be a reservoir junction:
+### Fluid transaction
 
-- It can receive from higher pressure.
-- It can pass pressure onward to lower outlets.
-- It still stores fluid and updates its own fill-Y.
-- Its tank-to-tank balancing remains separate from general pipe pressure.
+Every update must couple:
 
-## Tank fill-Y model
+1. source selection
+2. route selection
+3. simulated drain/fill
+4. pressure/head consumption
+5. actual transfer
+6. turbine output
 
-Tank waterline/fill level:
+No source block or tank amount should change unless the corresponding destination accepted the same fluid amount.
 
-```text
-fillY = tankBottomY + (% full * tankHeight)
-```
+### World fluids
 
-Where:
+Finite world bodies need source-block consumption. Infinite bodies need Create-compatible threshold detection. Fluid identity and body ownership must be known before pressure is applied.
 
-```text
-% full = fluidAmount / capacity
-```
+## Safe sequence for revisiting the graph
 
-For connected tanks:
+1. Finish the tank-fed Head Turbine MVP.
+2. Add a dedicated component cache with invalidation tests.
+3. Implement finite reservoir-to-outlet transfer without turbines.
+4. Add explicit pressure budgeting.
+5. Add tanks as reservoir nodes.
+6. Add directional edges.
+7. Add world bodies and infinite-source rules last.
 
-```text
-1. Collect connected tanks of the same fluid group.
-2. Sum total fluid.
-3. Solve the shared target fill-Y that preserves total fluid.
-4. Convert target fill-Y back to target amount for each tank.
-5. Move all tanks toward the target together.
-6. Drain highest fill-Y surplus tanks first.
-7. Fill lowest fill-Y deficit tanks first.
-```
-
-## Flow intensity
-
-Flow rate should depend on fill-Y/head difference.
-
-Expected feel:
-
-```text
-small fill-Y difference = slow movement
-large fill-Y difference = faster movement
-near target = slow final settling
-```
-
-Lava should move slower/heavier than water.
-
-Current tuning notes:
-
-```text
-water tank cap: 100mb/update
-lava tank cap: 25mb/update
-water smoothing factor: 0.20
-lava smoothing factor: 0.08
-lava pipe pressure multiplier: 0.35
-```
-
-These are tuning values, not final constants.
-
-## Future bulk fluid mover
-
-A future block should act like a hose pulley for moving large bodies of water through pipes.
-
-Intent:
-
-- Pull from world fluid bodies.
-- Push into pipe graph.
-- Respect an infinite-source/world-body threshold.
-- For bodies smaller than the infinite-source threshold, actually consume source blocks.
-- For infinite bodies, behave more like an infinite reservoir/source.
-
-This is likely a dedicated block, not just passive pipe behavior.
-
-## Turbines
-
-Two turbine directions are desired:
-
-1. **Inline turbine**
-   - Pipe component that generates stress from flowing fluid passing through it.
-   - Should probably add flow resistance or consume some pressure/head.
-
-2. **Multiblock waterfall turbine**
-   - Uses flowing water/lava falling through a vertical area.
-   - Higher waterfall = more stress generated.
-   - Consumes source blocks from the body of water at the top of the flow when the body is smaller than the infinite-source variable for the world.
-   - If the top source is considered infinite, turbine can run as long as the fall/flow remains valid.
-
-Important design constraint:
-
-```text
-Turbines should use real flow/head, not duplicate free power from the same pressure multiple times.
-```
-
-Possible rule:
-
-```text
-A turbine consumes pressure/head from the graph. Downstream fluid can continue, but the same head should not generate infinite chained power.
-```
-
-## Next graph rewrite goal
-
-The next pressure graph pass should support:
-
-```text
-- pipe-only source-to-lower-outlet movement
-- tanks as reservoir bridge nodes
-- tank smoothing kept separate
-- future directional valve edges
-- future turbine/head consumption hooks
-- future bulk fluid mover/source-body hooks
-```
-
-Avoid bolting all of this into the current tank tick loop. The pipe graph needs a real graph service with explicit node/edge types.
+The later graph should extend a proven turbine transfer model rather than replace it.
