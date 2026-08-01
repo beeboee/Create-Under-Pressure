@@ -9,7 +9,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
 
-/** Shared current-plan cache for execution adapters, diagnostics, and leases. */
+/** Shared current-plan cache for execution adapters, diagnostics, and short route leases. */
 public final class HydraulicPlanRuntime {
     private HydraulicPlanRuntime() {}
 
@@ -48,6 +48,9 @@ public final class HydraulicPlanRuntime {
     }
 
     public static Set<String> lastSelectedRouteKeys(Level level, BlockPos owner) {
+        CachedPlan cached = cached(level, owner);
+        if (!isRecent(level, cached)) return Set.of();
+
         Map<BlockPos, Set<String>> routes = LAST_SELECTED_ROUTES.get(level);
         if (routes == null) return Set.of();
         return routes.getOrDefault(owner, Set.of());
@@ -57,7 +60,9 @@ public final class HydraulicPlanRuntime {
         Map<BlockPos, CachedPlan> plans = PLANS.get(level);
         if (plans == null) return Set.of();
         for (Map.Entry<BlockPos, CachedPlan> entry : plans.entrySet()) {
-            if (entry.getValue().result().pipes().contains(pipe)) return lastSelectedRouteKeys(level, entry.getKey());
+            CachedPlan cached = entry.getValue();
+            if (!isRecent(level, cached)) continue;
+            if (cached.result().pipes().contains(pipe)) return lastSelectedRouteKeys(level, entry.getKey());
         }
         return Set.of();
     }
@@ -74,12 +79,11 @@ public final class HydraulicPlanRuntime {
 
     public static WorldMode worldMode(Level level, BlockPos pipe, Direction face) {
         if (level == null || pipe == null || face == null) return WorldMode.NONE;
-        long time = level.getGameTime();
         Map<BlockPos, CachedPlan> plans = PLANS.get(level);
         if (plans == null) return WorldMode.NONE;
 
         for (CachedPlan cached : plans.values()) {
-            if (time - cached.gameTime() > MAX_PLAN_AGE) continue;
+            if (!isRecent(level, cached)) continue;
             for (HydraulicPlan.Action action : cached.plan().actions()) {
                 HydraulicPlan.Route route = action.route();
                 if (route.source().type() == HydraulicPlan.PortType.WORLD
@@ -99,9 +103,29 @@ public final class HydraulicPlanRuntime {
         };
     }
 
+    private static boolean isRecent(Level level, CachedPlan cached) {
+        return level != null && cached != null && level.getGameTime() - cached.gameTime() <= MAX_PLAN_AGE;
+    }
+
     private static void prune(Level level, long gameTime) {
         Map<BlockPos, CachedPlan> plans = PLANS.get(level);
-        if (plans != null) plans.entrySet().removeIf(entry -> gameTime - entry.getValue().gameTime() > MAX_PLAN_AGE);
+        if (plans == null) {
+            LAST_SELECTED_ROUTES.remove(level);
+            return;
+        }
+
+        plans.entrySet().removeIf(entry -> gameTime - entry.getValue().gameTime() > MAX_PLAN_AGE);
+        if (plans.isEmpty()) {
+            PLANS.remove(level);
+            LAST_SELECTED_ROUTES.remove(level);
+            return;
+        }
+
+        Map<BlockPos, Set<String>> routes = LAST_SELECTED_ROUTES.get(level);
+        if (routes != null) {
+            routes.keySet().removeIf(owner -> !plans.containsKey(owner));
+            if (routes.isEmpty()) LAST_SELECTED_ROUTES.remove(level);
+        }
     }
 
     private static CachedPlan cached(Level level, BlockPos owner) {

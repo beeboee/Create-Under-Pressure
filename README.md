@@ -1,119 +1,114 @@
 # Create: Under Pressure
 
-Current dev version: `0.1.2`
+Current development version: `0.1.3`
 
-A Create addon that adds fluid pressure to Create's existing pipe and fluid systems.
+A Create addon that adds hydraulic head to Create's existing fluid pipes without replacing Create's transfer engine.
 
-The goal is to make height, fluid type, and flow direction matter without replacing Create's pipes. Tanks, reservoirs, outlets, and machines should be able to interact through pressure instead of relying only on pumps.
+The intended division of responsibility is:
 
-This is being built for:
+- **Under Pressure** decides whether fluid can move, which direction it should move, and which route wins.
+- **Create** performs the actual transfer, capability handling, branching, pipe state, animation, particles, and world-pool behavior.
+
+Built for:
 
 - Minecraft `1.21.1`
 - NeoForge `21.1.227`
 - Create `6.0.10`
 - Java `21`
 
+## Current priority
+
+The hydraulic runtime has to be dependable before turbine work begins.
+
+The current milestone is a stable shared planner that supports tanks, world fluids, generic handlers, and Create pumps while conserving fluid and respecting physical contact height. The Head Turbine remains planned, but it is deliberately deferred until the acceptance tests in [`docs/hydraulic-acceptance-tests.md`](docs/hydraulic-acceptance-tests.md) pass.
+
+## Current architecture
+
+### Contact-aware hydraulic graph
+
+The planner scans Create's real pipe topology and models each physical connection separately.
+
+- Every tank-pipe contact is its own hydraulic port.
+- A tank outlet can only reach fluid above that contact's cutoff elevation.
+- Generic fluid handlers are discovered through NeoForge capabilities.
+- Pump input and output sides are directional graph edges.
+- World endpoints use the exact open-pipe end as their root.
+
+### Head solver
+
+Head controls eligibility and direction rather than transfer speed.
+
+- Tank source head is its actual fluid surface.
+- World source head is the fluid surface at the open end.
+- Powered Create pumps add `round(abs(RPM) / 8)` blocks of head from input to output, capped at 32.
+- Reverse pump traversal receives no head gain.
+- Routes cannot climb above their delivered head.
+
+### Fixed Create transfer rate
+
+Selected routes project pressure into Create at a target rate of `128 mB/t`.
+
+Create remains responsible for simulation, execution, fluid compatibility, endpoint capabilities, branch behavior, and native pipe flow state. Pipe length and bends can break ties but do not reduce throughput.
+
+### World-fluid adapter
+
+When a selected route uses an open pipe end, the normal one-block open-end handler is replaced with a persistent adapter built from Create's hose-pulley filling and draining behavior.
+
+This is intended to preserve Create's pool search, infinite-body configuration, source consumption order, and counterpart behavior instead of reproducing them in custom executors.
+
 ## Version notes
+
+### `0.1.3`
+
+Hydraulic runtime cutover and stabilization:
+
+- Added one shared scan → plan → pressure-projection runtime.
+- Added physical tank contact ports with cutoff-aware reachable volume.
+- Changed planned throughput to a fixed `128 mB/t` instead of head- or distance-scaled flow.
+- Corrected pump head gain to input → output.
+- Added persistent Create hose behavior for active world endpoints.
+- Prevented stale cached plans and route leases from influencing later networks indefinitely.
+- Deferred the Head Turbine until the hydraulic acceptance suite passes.
 
 ### `0.1.2`
 
-Head-graph pressure pass:
-
-- Replaced the single best-source route picker with a graph-style head solver.
-- Pipe networks now evaluate all valid higher-head endpoints against lower-head receivers instead of stopping at one selected source.
-- Removed the old blocker/ownership path logic that caused larger multi-tank networks to repeatedly report `GRAPH blocked`.
-- Added simple pipe resistance based on route length so longer paths apply less pressure than short direct paths.
-- Tank-to-tank pressure now keeps most of its head force instead of being heavily reduced.
-- Debug output now reports `GRAPH settle` and per-route head/conductance/pressure details.
+Earlier head-graph experiments. This version accumulated several manual transfer and visual systems that have since been superseded by the shared runtime.
 
 ### `0.1.1`
 
-Development/debug cleanup baseline:
+Debug logging and early pressure experiments.
 
-- Added improved debug-stick logging sessions.
-- Debug logs now write to `run/logs/create-under-pressure/`.
-- Right-clicking the debug stick extends logging by 10 seconds.
-- Shift-right-clicking the debug stick stops logging.
-- Debug stick gets temporary enchantment glint while logging.
-- Removed the direct tank-equalizer experiment that caused bucket-sized transfers.
-- Kept pressure-service cleanup, tank surface math improvements, and fluid compatibility checks.
+## Required behavior before turbine work
 
-### `0.1.0`
+The hydraulic runtime is ready to build on only when all of these are repeatable:
 
-Initial scaffold and early pressure experiments.
+1. Uneven tanks settle without draining fluid below an outlet's cutoff.
+2. World-to-tank transfer conserves every consumed source block.
+3. Tank-to-world transfer never drains before the world output accepts fluid.
+4. World-to-world routes do not lose fluid, duplicate fluid, or ping-pong newly placed sources.
+5. Generic Create/addon fluid handlers work without custom inventory code.
+6. Pumps add directional head while transfer remains capped at `128 mB/t`.
+7. Branch selection remains deterministic and does not alternate routes without a hydraulic reason.
+8. Native Create pipe flow and particles accurately represent the transfer that actually occurred.
 
-## Planned features
+## Planned later features
 
-### Head pressure
+Once the hydraulic runtime is stable:
 
-Fluid above a pipe, outlet, or turbine can create pressure below it.
+- Head Turbine
+- water/lava-specific kinetic output
+- valves and one-way gates
+- turbine head consumption to prevent free chained generation
+- additional configuration and compatibility work
 
-A tall tank should feel different from a tank sitting on the floor. Same fluid, more height, more push.
+## Non-goals
 
-### Head Turbine
+- a replacement pipe system
+- full real-world computational fluid dynamics
+- pipe bursting in the first release
+- arbitrary per-segment pressure simulation
+- free infinite turbine chains
 
-The main planned block is the **Head Turbine**.
+## Development status
 
-Think of it like a hose pulley in reverse:
-
-- a hose pulley uses rotation to move fluid
-- a head turbine uses moving fluid to make rotation
-
-Put fluid above it, give that fluid somewhere to go, and the turbine generates Create rotational power.
-
-### Water vs lava
-
-Water and lava should not feel like copy-pasted fluids.
-
-Planned behavior:
-
-- **Water**: faster RPM, lower stress capacity
-- **Lava**: slower RPM, higher stress capacity
-
-So water is better for speed, lava is better for heavier machines.
-
-### Source block behavior
-
-For world fluids, the turbine should behave a bit like an inverse hose pulley.
-
-Small pools should get drained. Big enough bodies should count as renewable, using Create/Minecraft's infinite-fluid behavior where possible.
-
-That means a tiny floating puddle should not become a free infinite power plant, but a real reservoir should work.
-
-### Overstress stops flow
-
-If the turbine is connected to an overstressed kinetic network, the turbine should stop and the fluid should stop moving.
-
-No free fluid transfer through a jammed machine.
-
-## What this mod is not trying to do
-
-At least for now, this is not trying to add a whole new pipe system.
-
-Create already has pipes. The goal is to make pressure interact with Create's existing fluid machinery, not reinvent everything from scratch.
-
-Also probably not v1 stuff:
-
-- pipe bursting
-- full fluid simulation per pipe segment
-- custom pressure pipe blocks
-- infinite turbine chains
-- complicated real-world fluid physics
-
-## Development plan
-
-First goal: get a simple Head Turbine working in a tiny test setup.
-
-After that:
-
-1. Add pressure math.
-2. Detect valid upstream fluid sources.
-3. Consume source blocks when appropriate.
-4. Generate RPM/stress based on fluid type and head height.
-5. Hook into Create's pipe/fluid behavior carefully.
-
-Mixins will probably be needed, but they should be small and focused. The mod should use Create's systems where it can and only patch internals where it has to.
-
-## Status
-
-Early development. Pressure experiments are playable in dev, but behavior is still being refined.
+Active hydraulic-runtime testing. The turbine is not the current implementation milestone.
