@@ -1,70 +1,38 @@
-# In-Pipe Pressure
+# Deferred: Passive In-Pipe Pressure
 
-This is the first pressure system to build.
+Passive gravity-fed pressure through arbitrary Create pipe networks is outside the first Head Turbine milestone.
 
-World-fluid pressure can come later. For now, the mod should make Create tanks pressure nearby Create pipe networks.
+## Intended rule
 
-## Rule
-
-A Create fluid tank pressurizes connected pipe networks below the tank.
-
-If a pipe branch rises back up to the Y level of the tank's bottom layer, pressure stops there. The tank should not behave like a pump that can lift fluid back up to its own base height or higher.
-
-In plain terms:
+A higher fluid surface may drive fluid toward a genuinely lower destination. A branch that rises beyond the available head must stop carrying that pressure.
 
 ```text
-Tank above the pipe network: pressure works.
-Pipe branch climbs back to tank-bottom Y: pressure stops.
-Pipe branch stays below tank-bottom Y: pressure can keep flowing.
+higher reservoir -> lower pipe route -> lower destination: valid
+higher reservoir -> route climbs above available head: blocked
 ```
 
-## Why this rule
+## Why implementation is deferred
 
-This keeps the feature easy to understand and avoids making tanks into free all-direction pumps.
+Create's pressure values are additive and shared with mechanical pumps. A mod that periodically calls `addPressure(...)` needs a safe ownership and replacement strategy; repeatedly adding the same value is incorrect.
 
-The tank acts like head pressure, not magic powered pumping.
+A per-pipe mixin also scales badly because every pipe can trigger another graph walk. General passive pressure needs a cached connected-component service with explicit invalidation and one update owner.
 
-## Create hook plan
+## Requirements
 
-Create already has pipe pressure logic.
+Before this feature is implemented, the graph design must define:
 
-The important existing pieces are:
+- source and destination fluid identity
+- finite amount and transfer limits
+- source surface height
+- route elevation limits
+- branch capacity and direction
+- component ownership and invalidation
+- pressure contribution ownership
+- turbine pressure/head consumption
+- world-source consumption and infinite-body rules
 
-- `FluidTransportBehaviour.addPressure(...)`
-- `FluidTransportBehaviour.wipePressure()`
-- `FluidPropagator.getPipe(...)`
-- `FluidPropagator.getPipeConnections(...)`
-- the pump's graph-walking pressure distribution logic
+## Relationship to the turbine
 
-So the first implementation should not replace Create pipes.
+The Head Turbine MVP uses a local, explicit source-to-turbine-to-destination transaction. That implementation should establish the transfer, load, and head-consumption rules that a later passive graph can reuse.
 
-Instead:
-
-1. Hook Create tank ticks.
-2. When a controller tank has fluid, find adjacent pipe networks.
-3. Walk the pipe graph outward from the tank.
-4. Stop walking any branch that reaches the tank-bottom Y level.
-5. Apply Create pipe pressure to valid pipe faces.
-6. Let Create's existing pipe flow code do the actual transfer.
-
-## First approximation
-
-Pressure strength can start simple:
-
-```text
-pressure = min(maxPressure, tankBottomY - pipeY)
-```
-
-Later this can include:
-
-- actual fluid surface height
-- tank fill percentage
-- fluid type
-- config multipliers
-- turbine load
-
-## Important limitation
-
-This is intentionally in-pipe only.
-
-It does not yet pull from world source blocks, infinite bodies, oceans, reservoirs, or hose-pulley-style fluid bodies.
+Do not reintroduce passive pressure by injecting a full network scan into every `FluidTransportBehaviour.tick()` call.
