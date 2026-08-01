@@ -1,124 +1,171 @@
-# Design Notes
+# Hydraulic Runtime Design
 
 ## Goal
 
-Add head pressure behavior to Create fluid systems without replacing Create's pipes.
+Add gameplay-readable hydraulic head to Create's existing fluid system without replacing Create's pipes or rebuilding its transfer engine.
 
-The mod should feel like an extension of Create, not a parallel fluid system.
+The core boundary is:
 
-## Core mechanic
+- Under Pressure owns hydraulic topology, head reachability, direction, and route selection.
+- Create owns fluid simulation/execution, endpoint capabilities, branching, pipe flow state, animation, particles, and hose-pulley pool behavior.
 
-A fluid source above a turbine or outlet provides head pressure.
+## Current milestone
 
-Pressure can come from:
+Stabilize passive hydraulic movement through tanks, world endpoints, generic fluid handlers, and Create pumps.
 
-- Create fluid tanks
-- world fluid source blocks
-- large/infinite fluid bodies
+The Head Turbine is downstream of this work. It should consume a trustworthy route and measured flow; it should not become another execution path while the base hydraulic runtime is still being corrected.
 
-Pressure can drive:
+## Graph model
 
-- a Head Turbine that generates rotational power
-- later, gravity-fed outlets or passive fluid movement
+### Nodes
 
-## Head Turbine
+The graph uses physical connection points rather than collapsing whole blocks into one abstract endpoint.
 
-The Head Turbine is the first important block.
+- individual pipe faces
+- individual tank contacts
+- world open ends
+- generic fluid-handler contacts
+- pump input and output sides
+- future valve/gate sides
 
-It behaves like an inverse hose pulley:
+### Edges
 
-- Create hose pulley: kinetic energy moves fluid
-- Head Turbine: fluid movement creates kinetic energy
+- Normal pipe internal connection: bidirectional, zero head gain.
+- Adjacent pipe connection: bidirectional, zero head gain.
+- Powered pump input → output: directional head gain.
+- Pump output → input: allowed with no gain unless later made one-way by design.
+- Future one-way gate: directed edge.
+- Future valve: edge with a throughput multiplier.
 
-## World-fluid consumption
+Tanks join nearby pipe components into one planning domain, but fluid still enters and exits through real Create tank capabilities. The planner must never directly teleport inventory between tank contacts.
 
-When drawing from world fluids:
+## Tank contacts
 
-- small upstream pools should lose source blocks
-- large enough bodies should be treated as renewable
-- the threshold should mirror or respect Create's infinite-fluid-body logic when possible
+Every physical pipe-to-tank connection is a separate hydraulic port.
 
-This avoids making a tiny elevated puddle into infinite power while still allowing large reservoirs to work.
+For each contact the planner records:
 
-## Kinetic output
+- tank controller
+- pipe and face
+- actual fluid surface
+- contact cutoff elevation
+- total stored amount
+- amount reachable above that cutoff
+- fluid identity
 
-The turbine outputs RPM and stress capacity based on:
+Rules:
 
-- fluid type
-- head height
-- available flow
-- config multipliers
+- Fluid below a source contact's cutoff is unreachable from that contact.
+- A tank can receive only from head above its current surface/contact requirement.
+- Different-height contacts on the same tank remain distinct.
+- Equalization stops at the shared waterline or the source cutoff, whichever is reached first.
+- A tank may receive on one contact and provide from another only through Create's real handler behavior.
 
-Suggested defaults:
+## Sources and head
+
+- Tank source: actual fluid-surface elevation.
+- World source: fluid-surface elevation at the selected open end.
+- Generic handler: contact elevation unless a more specific adapter supplies a surface model.
+- Pump: adds `round(abs(RPM) / 8)` blocks of head from input to output, capped at 32.
+
+A route is eligible only when delivered head exceeds the receiving requirement. Routes cannot climb above their available head.
+
+This is a maximum-reachable-head gameplay solver, not a full pressure simulation.
+
+## Throughput
+
+Head determines eligibility, direction, and route priority.
+
+Base throughput is `128 mB/t`.
+
+Create pressure projection uses the amount the selected action can actually move, up to that cap. Pipe length and bends may be deterministic tie-breakers but do not reduce flow. Later valves may deliberately reduce throughput.
+
+## Route selection
+
+Selection order should remain stable and explainable:
+
+1. Continue a still-valid recent lease.
+2. Require executable source supply and destination demand.
+3. Prefer lower receiving head.
+4. Prefer stronger delivered-head margin where needed.
+5. Use route length and coordinates only as deterministic tie-breakers.
+
+Leases are short-lived. A cached route must not survive after its plan expires and influence a later unrelated scan.
+
+## Create pressure projection
+
+One runtime owns:
 
 ```text
-Water:
-- higher RPM
-- lower stress capacity
-
-Lava:
-- lower RPM
-- higher stress capacity
+observe pipes
+→ scan each network once
+→ build one plan
+→ project selected pressure once
+→ cache and log that same plan
 ```
 
-## Overstress behavior
+The runtime projects selected routes into Create pipe connections. It must not run a second direct inventory/world executor for the same action.
 
-If the turbine's kinetic network is overstressed:
+Create then owns:
 
-- turbine rotation stops
-- fluid movement stops
-- upstream source blocks are not consumed
+- simulation before execution
+- drain/fill capability calls
+- fluid compatibility
+- branch distribution
+- pipe flow continuity
+- collisions
+- particles and rendered flow state
 
-This prevents fluid from being wasted into a locked machine and makes overstress mechanically meaningful.
+## World endpoints
 
-## Mixin strategy
-
-Mixins are risky only when they become broad, fragile, or mixed directly into gameplay logic.
-
-Acceptable Mixins:
-
-- accessors/invokers for Create internals with no public API
-- tiny injections at specific transfer decision points
-- compatibility shims isolated to one package
-
-Avoid:
-
-- replacing whole Create methods
-- duplicating Create pipe-network logic
-- spreading Create-internal assumptions across block entities
-- depending on obfuscated names where stable mapped names are available
-
-Internal structure should be:
+An active world endpoint uses a persistent adapter built from Create's own hose-pulley classes:
 
 ```text
-content/head_turbine
-  gameplay logic
-
-pressure
-  pressure math and source selection
-
-integration/create
-  Create-facing adapter classes
-
-mixin
-  tiny accessors/injections only
+Create FluidNetwork
+→ OpenEndedPipe
+→ Under Pressure endpoint adapter
+→ persistent HosePulleyFluidHandler
+→ Create FluidFillingBehaviour / FluidDrainingBehaviour
 ```
 
-If Create internals change later, most repairs should happen inside `integration/create` and `mixin`, not across the whole mod.
+Requirements:
 
-## First implementation pass
+- key context to the physical open end
+- use the actual open-end position as the root
+- persist context between ticks
+- tick behavior once per game tick
+- respect Create's configured infinite-fluid threshold
+- use Create's counterpart behavior to prevent immediate reversal
+- do not manually search for substitute roots
+- do not fast-forward dozens of pseudo-ticks
+- do not drain before the output can accept the transaction
 
-1. Set up NeoForge/Create scaffold.
-2. Register Head Turbine block and block entity.
-3. Add config values for water/lava RPM and stress.
-4. Implement standalone pressure math with tests or debug logging.
-5. Add Create integration adapter.
-6. Add minimal Mixins only after inspecting the exact Create 6.0.10 classes.
+## Mixins
 
-## Non-goals for v1
+Mixins should remain narrow:
 
-- custom pipe blocks
-- pipe bursting
-- full fluid pressure simulation
-- arbitrary fluid dynamics
+- observe `FluidTransportBehaviour.tick`
+- expose exact pressure storage when no public setter exists
+- replace an active `OpenEndedPipe` handler with the hose adapter
+
+Avoid broad method replacement and gameplay logic inside mixins.
+
+## Deferred turbine design
+
+Once the hydraulic acceptance tests pass, a turbine can become a route component that:
+
+- requires actual selected flow
+- generates rotation from fluid type and available head
+- consumes head so chained turbines cannot duplicate power
+- stops fluid when its kinetic network is overstressed
+
+Until then, turbine code would hide hydraulic bugs behind another system and is intentionally out of scope.
+
+## Non-goals
+
+- custom replacement pipes
+- full computational fluid dynamics
+- pipe bursting in the initial release
+- arbitrary resistance on every segment
+- duplicate direct executors alongside Create's fluid network
 - infinite turbine chains
